@@ -4,166 +4,159 @@
 
 | File | Status | Description |
 |------|--------|-------------|
-| `lane_follower.py` | New | Full two-lane track follower with PID, sign detection, state machine |
+| `lane_follower.py` | v1 (stable) | Full two-lane track follower with PID, OpenCV sign detection, state machine |
+| `lane_follower_v2.py` | v2 (active dev) | Replaces sign detection with OpenAI Vision API; grayscale junction stripe |
 | `cam_follower.py` | Updated v2 | Single dashed-line follower with multi-band scan and angle-aware PID |
+| `map.txt` | Reference | ASCII track layout sketch |
+| `Image (14).jpg` | Reference | Hand-drawn track diagram (lollipop / keyhole shape) |
 
 ---
 
-## lane_follower.py — what was built
+## Track Layout
 
-### Architecture
-- **Camera** (Picamera2, 640×480): primary sensor for lane detection and sign detection
-- **Grayscale sensors** (A0/A1/A2): fast boundary-crossing guard, fires before PID can react
-- **Ultrasonic**: obstacle stop at configurable distance
-- **Background thread**: sign detection runs async so it never blocks the 30 fps drive loop
+Lollipop / keyhole shape:
+- **Stem**: straight start/finish section, two lanes (right lane going, left lane returning)
+- **Oval**: loop at the top of the stem, joined at junction B
+- **Junction B**: where stem meets oval; B2 = right turn into oval, B1 = left turn returning
+- **Signs**: directional sign placed on the stem, visible from camera during approach
+
+### Physical marking rules
+- 3 tape lines throughout: left boundary (solid), right boundary (solid), centre dashes
+- **Junction stripe**: one solid white tape strip (~5cm wide) spanning full lane width,
+  placed at the base of the oval (where stem meets oval / where centre dashes end)
+- At junction B: outer oval boundary does NOT connect to stem boundaries
+- Centre dashes end at the junction stripe; oval has its own dashes forming the loop
+
+---
+
+## lane_follower_v2.py — Architecture
+
+### Design
+- **Camera** (Picamera2, 640×480): lane detection via adaptive HSV white mask
+- **OpenAI Vision API** (gpt-4o-mini): sign direction, queried every ~2s in background thread
+- **Grayscale sensors** (A0/A1/A2): junction stripe detection (all 3 > 600 simultaneously)
+- **Ultrasonic**: obstacle stop only (NOT used for junction confirmation on this track)
 
 ### State machine
 ```
-NORMAL → STOP_HELD  (stop sign detected)
-NORMAL → TURNING    (sign armed + lane gap fires the turn)
-TURNING → NORMAL    (after TURN_HOLD_SEC seconds)
-STOP_HELD → NORMAL  (after STOP_HOLD_SEC seconds)
+NORMAL → TURNING    (junction latch fires when AI responds with direction)
+NORMAL → STOP_HELD  (stop sign — not yet used)
+TURNING → NORMAL    (after TURN_HOLD_SEC = 2.2s)
 ```
 
-### Lane detection (`LaneDetector`)
-- Adaptive HSV white mask (threshold tracks ambient brightness via `ADAPTIVE_K`)
-- ROI: `LANE_ROI_TOP=0.42` to `LANE_ROI_BOT=0.82` (tuned for `CAM_TILT=-15°`)
-- Blobs split into left/right halves → weighted centroid per side → lane centre
-- If only one boundary visible: other side is inferred from frame edge
-- `last_error_valid` flag: True only when lines are actively found
+### Junction latch (key design — added session 2)
+The critical timing problem: GS stripe fires, AI responds 1.6s later, robot already past stripe.
 
-### Sign detection (`SignDetector`)
-- **TFLite unavailable on Python 3.13** — silently disabled on every previous run
-- Replaced with OpenCV-only classifier (`_opencv_classify`):
-  - HSV mask H=0–40 (red/orange/yellow) finds sign blobs
-  - For clear signs (bg brightness > 120): classify arrow direction from dark-pixel
-    distribution across left/right halves of crop
-  - For blurry/dark signs (bg < 120): fall back to sign's horizontal position in
-    frame (right half → "right", left half → "left")
-- Runs every `SIGN_INTERVAL=0.40s` in background thread
+Solution: `_junction_seen` flag persists after stripe crossing:
+1. GS stripe detected → set `_junction_seen = True`, slow to SPEED_CREEP
+2. Every frame: if `_junction_seen AND armed_dir != 'none'` → fire turn immediately
+3. `JUNCTION_LATCH_SEC = 6.0` timeout — if AI never responds, clear flag and give up
+4. Obstacle stop suppressed when `_junction_seen` is True (expected boundary at junction)
 
-### Sign arming + gap trigger (key design)
-The critical insight: **sign detection and turn execution are decoupled**.
+### OpenAI Sign Detector
+- `AI_POLL_SEC = 1.0` (effective cycle ~2s including ~1s API latency)
+- `AI_ARM_THRESHOLD = 1` (single response arms; stripe is the physical gate)
+- Client created once in `start()`, not per-call
+- Every response printed to terminal: `[AI]  right  (1.0s)`
+- API key stored in `/home/admin/.env`, loaded automatically at startup
 
-1. Sign detector increments `_sign_arm_cnt` each frame the sign is visible,
-   **only while lane markings are visible** (`last_error_valid == True`).
-   This prevents false arming when the robot is off-track.
-2. `_sign_arm_cnt` resets to 0 the moment the sign disappears.
-3. A turn is only committed when BOTH:
-   - `_sign_arm_cnt >= SIGN_ARM_FRAMES` (20 frames ≈ 0.67s of continuous sighting)
-   - Lane markings have ended for ≥ 2 consecutive frames (real junction, not a dash gap)
-
-### Known issues / limitations
-- OpenCV sign classifier is still noisy in environments with orange/yellow objects.
-  Works in practice because of the `last_error_valid` gate, but false positives exist.
-- Arrow direction detection (dark pixel analysis) is unreliable when the sign is small
-  or motion-blurred. Falls back to horizontal position heuristic which assumes the sign
-  post is on the same side as the intended turn.
-- `tflite_runtime` is **not available on Python 3.13**. The vilib install script
-  explicitly skips it for Python > 3.12. The TFLite code path is retained in
-  `SignDetector` but will never activate on this system.
-
-### Tuned constants (current values)
+### Tuned constants
 ```python
-CAM_TILT        = -15.0   # was -38.0; reduced to stop servo straining against limit
-LANE_ROI_TOP    = 0.42    # tuned to match where lines appear at -15° tilt
-LANE_ROI_BOT    = 0.82
-SIGN_CONFIDENCE = 70      # lowered from 82 (unused — TFLite not available)
-SIGN_MIN_AREA   = 900     # lowered from 1600
-SIGN_ARM_FRAMES = 20      # frames of continuous sign sighting to arm a turn
-KP, KI, KD     = 22.0, 0.15, 7.0
+CAM_TILT           = -15.0   # servo safe range; -38 strained against mechanical stop
+LANE_ROI_TOP       = 0.42    # tuned for -15° tilt
+LANE_ROI_BOT       = 0.82
+GS_WHITE_THRESHOLD = 600     # white tape reads 1400-3600; dark floor reads 200-400
+KP, KI, KD        = 22.0, 0.15, 7.0
+SPEED_CRUISE       = 14      # % motor speed
+TURN_HOLD_SEC      = 2.2
+JUNCTION_LATCH_SEC = 6.0
+AI_POLL_SEC        = 1.0
+AI_ARM_THRESHOLD   = 1
+```
+
+---
+
+## lane_follower.py — v1 (what was built in session 1)
+
+### Architecture
+- **Camera**: lane detection + OpenCV sign detection (HSV blob analysis)
+- **Grayscale**: boundary guard (single sensor alerts)
+- **Sign arming**: 20 consecutive frames of sign sighting + lane gap fires the turn
+- **Known issue**: OpenCV sign detection noisy in dynamic environments → replaced in v2
+
+### Key constants
+```python
+SIGN_ARM_FRAMES = 20
+GAP_MAX_FRAMES  = 12
 SPEED_CRUISE    = 14
 TURN_HOLD_SEC   = 2.2
 ```
 
 ---
 
-## cam_follower.py — what changed (v1 → v2)
+## cam_follower.py — v2 changes (session 1)
 
 - Resolution: 320×240 → 640×480
-- ROI: single band → three bands (near/mid/far) with weighted centroid
-- PID: plain offset error → offset + look-ahead angle (`ANGLE_GAIN`)
-- White threshold: fixed → adaptive (tracks mean frame brightness)
-- Speed: binary follow/seek → confidence-scaled (white pixel count proxy)
-- Contour filter: none → aspect ratio check rejects non-line blobs
+- ROI: single band → three bands (near/mid/far) weighted centroid
+- PID: plain offset → offset + angle-aware look-ahead (`ANGLE_GAIN`)
+- White threshold: fixed → adaptive (tracks mean brightness)
+- Speed: binary → confidence-scaled (white pixel count proxy)
 - Gap handling: hard switch → decaying bias (`GAP_DECAY`, `GAP_BIAS`)
+
+---
+
+## Debugging history
+
+### Session 1 fixes
+| Problem | Root cause | Fix |
+|---------|-----------|-----|
+| Camera servo straining | CAM_TILT=-38° exceeded -35° limit | Changed to -15° |
+| ROI mismatch | Lines at 60-80% but ROI at 5-42% | Moved ROI to 0.42-0.82 |
+| TypeError on format string | `right_cx` was None, used `:>5` | Conditional format |
+| TFLite disabled silently | Not available on Python 3.13 | Replaced with OpenCV classifier |
+| Robot turning immediately | False arm count without lane | Added `last_error_valid` gate |
+| Git push auth failure | HTTPS needs token | Token embedded in remote URL |
+
+### Session 2 fixes
+| Problem | Root cause | Fix |
+|---------|-----------|-----|
+| Robot not turning at junction | AI responds after stripe (timing) | Added `_junction_seen` latch |
+| Obstacle stop at junction | Hard stop triggered at junction boundary | Suppressed when `_junction_seen` |
+| openai not installed | Python 3.13, needed explicit install | `pip3 install openai --break-system-packages` |
+| API client overhead | `openai.OpenAI()` created per-call | Moved to `start()`, reused |
 
 ---
 
 ## What was tried and did NOT work
 
-### ROI placement iterations
-The ROI had to be moved three times as the camera tilt changed:
-- Original (`-38°` tilt): lines at top 5–30% of frame → ROI 0.05–0.42
-- After tilt change to `-15°`: lines dropped to 60–80% of frame → ROI 0.42–0.82
-
-### Sign detection approaches tried
-1. **TFLite** (vilib model): not importable on Python 3.13 — silently disabled
-2. **Color blob + TFLite**: same problem
-3. **HSV blob + white pixel centroid**: sign is too dark/blurry, max gray = 128,
-   zero white pixels in the sign crop
-4. **HSV blob + dark pixel analysis**: unreliable due to motion blur and similar-
-   colored background objects (chairs, equipment, sign pole)
-5. **Temporal filter + lane-gated arming**: reduces but does not eliminate
-   false positives; still misclassifies the cyan sign pole as a "left" sign
+1. **TFLite sign detection**: not importable on Python 3.13
+2. **OpenCV HSV blob**: noisy, false positives from similar-colored objects
+3. **Temporal filter + lane-gated arming**: reduced but didn't eliminate false positives
+4. **Sonar gate at junction**: this track has no wall directly ahead at B (oval opens up)
+5. **One-shot GS stripe trigger**: AI arrived 1.6s after stripe → robot already past it
 
 ---
 
-## Agreed next architecture (NOT yet implemented)
+## Known issues / pending
 
-### Problem statement
-The robot navigates a dynamic track with:
-- Straight sections (curve handled by PID — no sign needed)
-- Dash gaps (brief, no action — hold heading)
-- Real junctions (lane ends, robot must turn based on sign)
-
-A reliable junction-navigation system needs two independent signals:
-- **Direction**: which way to turn
-- **When**: exactly when to execute the turn
-
-### Proposed solution: periodic AI vision + hardware junction detection
-
-**Direction — OpenAI Vision API (async background thread)**
-- Send a frame to GPT-4o Vision every 2–3 seconds, unconditionally (not triggered
-  by sign detection — this eliminates the pre-detection bootstrapping problem)
-- Prompt: *"Is there a junction direction sign visible? Reply with exactly one word:
-  left, right, forward, or none."*
-- Require 2+ consecutive identical responses before arming the direction
-- This handles dynamic layouts, arbitrary sign types, and requires no local ML
-
-**When — Grayscale sensors (hardware)**
-- At a real junction, a perpendicular white line (junction marker) triggers all three
-  grayscale sensors simultaneously → very reliable hardware detection
-- Ultrasonic adds a third gate: obstacle ahead confirms real junction vs. dash gap
-- The armed direction fires when grayscale detects junction marker AND ultrasonic
-  confirms obstacle ahead
-
-**Why this is better**
-- OpenAI is queried while the sign is visible from far away (5–15 seconds of
-  approach time at slow speed) — latency is not a problem
-- The AI is never consulted at the junction itself (where camera can't see side paths)
-- `last_error_valid` gate is replaced by the grayscale hardware trigger — much more
-  reliable than software lane detection
-- False positive AI responses are filtered by requiring consecutive agreement
-- Dynamic layout works because the AI reads whatever sign is actually in the scene
-
-### Implementation plan (when ready to build)
-1. Add `OpenAISignDetector` class (replaces `SignDetector`) with async thread
-2. Add junction detection using all-three-sensors-on-white pattern in `_gs_alert()`
-3. Arm direction from AI response (2+ consecutive agreement required)
-4. Fire turn when junction marker AND ultrasonic obstacle both trigger
-5. After turn, reset arm state and re-acquire lane via PID
-
-### Dependencies needed
-- `openai` Python package (`pip install openai`)
-- OpenAI API key (set as env var `OPENAI_API_KEY` or in `.env`)
-- Stable WiFi on the Pi (already present)
+- **Junction latch not yet tested** (session 2 ended before test run)
+- `TURN_HOLD_SEC = 2.2` may need tuning depending on turn radius at B
+- Camera ROI / white threshold untested on oval section (may need separate tuning)
+- Left-lane return path (B1→A) not yet tested; may need `--left-lane` flag
 
 ---
 
-## Hardware notes (this robot)
+## Hardware notes
 - Python 3.13.5 — TFLite unavailable, use OpenCV or cloud AI
-- Servo tilt range: -35° to +65°; -38° strains against mechanical stop → use -15°
-- Grayscale calibration: dark mat ≈ 200–400 ADC, white tape ≈ 800–2000 ADC
-- `GS_WHITE_THRESHOLD = 600` is the current boundary detection threshold
-- Motor calibration: `picarx_dir_motor = [1, 1]` (no direction flip needed)
+- Servo tilt range: -35° to +65°; use -15° for front-facing view
+- Grayscale: dark mat ≈ 200–400 ADC, white tape ≈ 1400–3600 ADC (confirmed)
+- `GS_WHITE_THRESHOLD = 600` confirmed working
+- OpenAI API latency on Pi over WiFi: ~1.0–1.8s per call
+- `openai` package: installed via `pip3 install openai --break-system-packages`
+- API key stored in `/home/admin/.env` (chmod 600), auto-loaded by lane_follower_v2.py
+
+## Dependencies
+```
+pip3 install openai --break-system-packages
+```
+OPENAI_API_KEY stored in /home/admin/.env — do NOT commit this file.
