@@ -100,8 +100,9 @@ GAP_HOLD_DECAY  =  0.97  # per-frame decay of last error during gap
 GAP_JUNCTION_MIN =  5    # camera-gap frames needed before sonar gate is checked
 
 # Turn execution
-TURN_HOLD_SEC      = 2.2  # seconds to hold full steer during a turn
-JUNCTION_LATCH_SEC = 6.0  # seconds to remember a junction stripe before giving up
+TURN_HOLD_SEC         = 2.2   # seconds to hold full steer during a turn
+JUNCTION_LATCH_SEC    = 6.0   # seconds to remember a junction stripe before giving up
+JUNCTION_DEFAULT_DIR  = 'right'  # fallback if AI never arms before latch expires
 TURN_COOLDOWN   = 5.0    # seconds after turn before new sign arming is allowed
 STOP_HOLD_SEC   = 3.0    # seconds to pause at a stop sign
 
@@ -388,6 +389,8 @@ class OpenAISignDetector:
                     # Direction changed — restart count
                     self._pending = response
                     self._arm_cnt = 1
+                    if self._arm_cnt >= AI_ARM_THRESHOLD:
+                        self._armed_dir = response
 
             sleep(AI_POLL_SEC)
 
@@ -519,8 +522,14 @@ class LaneFollower:
                 self._junction_seen = False
                 return self._fire_turn(armed_dir, dist, 'LATCH+AI', frame, sign_det, now)
             if (now - self._junction_ts) > JUNCTION_LATCH_SEC:
-                self._junction_seen = False   # AI never responded — give up
-                print(' [JUNCTION] latch expired, no AI response', flush=True)
+                self._junction_seen = False
+                print(f' [JUNCTION] latch expired — no AI response, stopping.', flush=True)
+                # default fallback disabled — testing pure AI response
+                # return self._fire_turn(JUNCTION_DEFAULT_DIR, dist, 'latch-timeout', frame, sign_det, now)
+            # Still waiting — hold position, print every cycle
+            wait_s = now - self._junction_ts
+            print(f' [JUNCTION] waiting for AI...  {wait_s:.1f}s / {JUNCTION_LATCH_SEC:.0f}s  armed={armed_dir}', flush=True)
+            return 0.0, 0, f'JUNCTION wait AI {wait_s:.1f}s', frame
 
         # ── Junction stripe detection (GS all-white) ──────────────────────
         at_junction_gs = self._junction_gs(gs)
@@ -532,7 +541,12 @@ class LaneFollower:
             if not self._junction_seen:
                 self._junction_seen = True
                 self._junction_ts   = now
-                print(f' [JUNCTION] stripe latched, waiting for AI...', flush=True)
+                print(f' [JUNCTION] stripe latched  gs={gs}  armed={armed_dir}', flush=True)
+                os.makedirs('/tmp/lf_debug', exist_ok=True)
+                cv2.imwrite('/tmp/lf_debug/junction_latch.jpg', frame)
+                h, w2 = frame.shape[:2]
+                sign_roi = frame[int(h * SIGN_ROI_TOP):int(h * SIGN_ROI_BOT), :]
+                cv2.imwrite('/tmp/lf_debug/junction_sign_roi.jpg', sign_roi)
             speed = self._speed_for_dist(dist, SPEED_CREEP)
             return self._apply_steer(0.0), speed, 'JUNCTION latched (no arm)', frame
 
@@ -714,7 +728,7 @@ def main():
                 print(f' {label:56s} {steer:+5.1f}° {speed:3d}% {dist_s:>5}'
                       f' {gs_s:>15} {ai_s:>12}', flush=True)
 
-            if args.save_frames and cycle % 10 == 0:
+            if args.save_frames:
                 cv2.imwrite(f'/tmp/lf_debug/f{save_cyc:05d}.jpg', ann)
                 save_cyc += 1
 
