@@ -80,14 +80,14 @@ KI =  0.15
 KD =  7.0
 
 # Steering
-MAX_STEER  = 25.0   # servo hard limit (degrees)
+MAX_STEER  = 28.0   # servo hard limit (degrees)
 STEER_RATE =  7.0   # max change per frame
 
 # Speeds (%)
-SPEED_CRUISE  = 16
-SPEED_CORRECT = 13
-SPEED_CREEP   =  9
-SPEED_TURN    = 13
+SPEED_CRUISE  = 12
+SPEED_CORRECT = 10
+SPEED_CREEP   =  7
+SPEED_TURN    = 11
 
 # Obstacle / sonar
 STOP_DIST          = 15   # cm — full stop
