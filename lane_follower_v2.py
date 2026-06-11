@@ -60,12 +60,12 @@ WHITE_S_MAX  =  60
 ADAPTIVE_K   =  0.20
 
 # Lane ROI (fraction of frame height) — tuned for CAM_TILT = -15°
-LANE_ROI_TOP = 0.42
+LANE_ROI_TOP = 0.30
 LANE_ROI_BOT = 0.82
 
 # Sign ROI — upper portion where signs appear ahead of car
 SIGN_ROI_TOP = 0.00
-SIGN_ROI_BOT = 0.45
+SIGN_ROI_BOT = 0.65
 
 # Lane blob filters
 MIN_CONTOUR_AREA = 200
@@ -75,7 +75,7 @@ MIN_ASPECT_RATIO = 0.8
 GS_WHITE_THRESHOLD = 600
 
 # PID
-KP = 22.0
+KP = 28.0
 KI =  0.15
 KD =  7.0
 
@@ -84,10 +84,10 @@ MAX_STEER  = 25.0   # servo hard limit (degrees)
 STEER_RATE =  7.0   # max change per frame
 
 # Speeds (%)
-SPEED_CRUISE  = 14
-SPEED_CORRECT = 10
-SPEED_CREEP   =  7
-SPEED_TURN    = 10
+SPEED_CRUISE  = 16
+SPEED_CORRECT = 13
+SPEED_CREEP   =  9
+SPEED_TURN    = 13
 
 # Obstacle / sonar
 STOP_DIST          = 15   # cm — full stop
@@ -100,16 +100,23 @@ GAP_HOLD_DECAY  =  0.97  # per-frame decay of last error during gap
 GAP_JUNCTION_MIN =  5    # camera-gap frames needed before sonar gate is checked
 
 # Turn execution
-TURN_HOLD_SEC         = 2.2   # seconds to hold full steer during a turn
+TURN_HOLD_SEC         = 2.3   # seconds to hold full steer during a turn
 JUNCTION_LATCH_SEC    = 6.0   # seconds to remember a junction stripe before giving up
 JUNCTION_DEFAULT_DIR  = 'right'  # fallback if AI never arms before latch expires
 TURN_COOLDOWN   = 5.0    # seconds after turn before new sign arming is allowed
 STOP_HOLD_SEC   = 3.0    # seconds to pause at a stop sign
 
+# Stuck recovery
+RECOVERY_SONAR_CM    = 14    # cm — only recover when this close (tighter than STOP_DIST)
+RECOVERY_TRIGGER_SEC =  2.0  # seconds stopped before recovery begins
+RECOVERY_BACK_SEC    =  0.7  # seconds to reverse before AI recovery call
+RECOVERY_TURN_SEC    =  1.5  # seconds to turn during recovery
+RECOVERY_MAX_TRIES   =  2    # max attempts per stuck event before giving up
+
 # OpenAI sign detector
 AI_POLL_SEC      = 1.0   # seconds between API calls (after ~1s API latency = ~2s cycle)
 AI_ARM_THRESHOLD =  1    # responses to arm; stripe is the physical gate so 1 is safe
-AI_JPEG_QUALITY  = 70    # JPEG quality for API image upload (lower = faster)
+AI_JPEG_QUALITY  = 92    # JPEG quality for API image upload (lower = faster)
 
 # Loop
 LOOP_HZ     = 25
@@ -266,6 +273,13 @@ class OpenAISignDetector:
         "Do not explain. Do not punctuate."
     )
 
+    RECOVERY_PROMPT = (
+        "A small robot car has stopped against an obstacle on a road track and has "
+        "reversed slightly to get clearance. Looking at this camera image, should "
+        "the robot turn LEFT or RIGHT to get back onto the road lane? "
+        "Reply with exactly ONE word — left or right. Do not explain. Do not punctuate."
+    )
+
     def __init__(self, enabled: bool = True):
         self._enabled    = enabled
         self._lock       = threading.Lock()
@@ -318,6 +332,39 @@ class OpenAISignDetector:
             self._pending   = 'none'
             self._arm_cnt   = 0
             self._armed_dir = 'none'
+
+    def call_recovery(self, frame) -> str:
+        """Synchronous blocking call — asks AI which way to turn after backing away from obstacle."""
+        if not self._enabled or self._client is None:
+            return 'right'
+        b64 = self._frame_to_b64(frame)
+        if not b64:
+            return 'right'
+        try:
+            t0 = monotonic()
+            response = self._client.chat.completions.create(
+                model      = 'gpt-4o-mini',
+                max_tokens = 5,
+                timeout    = 8.0,
+                messages   = [{
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text',      'text': self.RECOVERY_PROMPT},
+                        {'type': 'image_url', 'image_url': {
+                            'url':    f'data:image/jpeg;base64,{b64}',
+                            'detail': 'low',
+                        }},
+                    ],
+                }],
+            )
+            word    = response.choices[0].message.content.strip().lower()
+            elapsed = monotonic() - t0
+            result  = word if word in ('left', 'right') else 'right'
+            print(f' [AI-RECOVERY] {result}  ({elapsed:.1f}s)', flush=True)
+            return result
+        except Exception as e:
+            print(f' [AI-RECOVERY] error: {e} — defaulting right', flush=True)
+            return 'right'
 
     # ── Internal ─────────────────────────────────────────────────────────────
 
@@ -401,9 +448,10 @@ class OpenAISignDetector:
 
 class LaneFollower:
 
-    NORMAL    = 'NORMAL'
-    TURNING   = 'TURNING'
-    STOP_HELD = 'STOP_HELD'
+    NORMAL     = 'NORMAL'
+    TURNING    = 'TURNING'
+    STOP_HELD  = 'STOP_HELD'
+    RECOVERING = 'RECOVERING'
 
     def __init__(self, drive_left_lane: bool = False):
         self._detector = LaneDetector(drive_left_lane)
@@ -426,6 +474,13 @@ class LaneFollower:
         # Junction latch — persists after stripe until AI responds or timeout
         self._junction_seen = False
         self._junction_ts   = 0.0
+
+        # Stuck recovery
+        self._obstacle_stop_ts  = 0.0   # when current obstacle stop started (0 = not stopped)
+        self._recovery_attempts = 0     # attempts for current stuck event
+        self._recovery_dir      = 0     # +1 right, -1 left
+        self._recovery_phase    = None  # 'backup' | 'turn'
+        self._recovery_ts       = 0.0
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -487,7 +542,24 @@ class LaneFollower:
 
         # ── Hard stop (obstacle very close) — suppressed at junction ─────
         if 0 < dist < STOP_DIST and self._state == self.NORMAL and not self._junction_seen:
-            return 0.0, 0, f'OBSTACLE stop ({dist:.0f}cm)', frame
+            if self._obstacle_stop_ts == 0.0:
+                self._obstacle_stop_ts = now
+            stopped_for = now - self._obstacle_stop_ts
+            if (dist <= RECOVERY_SONAR_CM
+                    and stopped_for >= RECOVERY_TRIGGER_SEC
+                    and self._recovery_attempts < RECOVERY_MAX_TRIES):
+                self._recovery_attempts += 1
+                self._recovery_phase = 'backup'
+                self._recovery_ts    = now
+                self._state          = self.RECOVERING
+                self._junction_seen  = False
+                print(f' [RECOVERY] attempt {self._recovery_attempts}/{RECOVERY_MAX_TRIES} — backing up', flush=True)
+                return 0.0, -SPEED_CREEP, 'RECOVERY start', frame
+            tag = 'RECOVERY EXHAUSTED' if self._recovery_attempts >= RECOVERY_MAX_TRIES else f'stuck {stopped_for:.1f}s'
+            return 0.0, 0, f'OBSTACLE {dist:.0f}cm  {tag}', frame
+        elif self._state == self.NORMAL and self._obstacle_stop_ts != 0.0:
+            self._obstacle_stop_ts  = 0.0
+            self._recovery_attempts = 0
 
         # ── State: executing a turn ───────────────────────────────────────
         if self._state == self.TURNING:
@@ -513,6 +585,38 @@ class LaneFollower:
                 self._state         = self.NORMAL
                 self._last_turn_end = now
                 sign_det.reset()
+
+        # ── State: obstacle stuck recovery ───────────────────────────────
+        if self._state == self.RECOVERING:
+            elapsed = now - self._recovery_ts
+            if self._recovery_phase == 'backup':
+                if elapsed < RECOVERY_BACK_SEC:
+                    return 0.0, -SPEED_CREEP, f'RECOVERY backup {elapsed:.1f}s', frame
+                # Backup done — pick direction from last known lane error (no AI call)
+                px.stop()
+                sleep(0.2)
+                if self._recovery_attempts == 1:
+                    # Use the same direction as the last junction turn so the car
+                    # re-enters the curve it was navigating. _turn_dir: +1=right, -1=left.
+                    rec_dir = 'right' if self._turn_dir >= 0 else 'left'
+                    print(f' [RECOVERY] attempt 1: last_turn={self._turn_dir:+d} → {rec_dir}', flush=True)
+                else:
+                    rec_dir = 'left' if self._recovery_dir > 0 else 'right'
+                    print(f' [RECOVERY] attempt {self._recovery_attempts}: flipping to {rec_dir}', flush=True)
+                self._recovery_dir   = +1 if rec_dir == 'right' else -1
+                self._recovery_phase = 'turn'
+                self._recovery_ts    = now
+            if self._recovery_phase == 'turn':
+                elapsed = now - self._recovery_ts
+                if elapsed < RECOVERY_TURN_SEC:
+                    steer = self._apply_steer(MAX_STEER * self._recovery_dir)
+                    return steer, SPEED_TURN, f'RECOVERY turn {"R" if self._recovery_dir>0 else "L"} {elapsed:.1f}s', frame
+                # Turn done — resume normal driving
+                self._state          = self.NORMAL
+                self._recovery_phase = None
+                self._i_err          = 0.0
+                self._obstacle_stop_ts = 0.0
+                print(' [RECOVERY] done — resuming', flush=True)
 
         # ── Junction latch: fire as soon as AI arms after stripe ─────────
         # The stripe sets _junction_seen; AI response may arrive seconds later.
@@ -593,7 +697,7 @@ class LaneFollower:
 
         if abs(error) < 0.20:
             speed = self._speed_for_dist(dist, SPEED_CRUISE)
-        elif abs(error) < 0.50:
+        elif abs(error) < 0.30:
             speed = self._speed_for_dist(dist, SPEED_CORRECT)
         else:
             speed = self._speed_for_dist(dist, SPEED_CREEP)
