@@ -28,6 +28,8 @@ import threading
 from pathlib import Path
 from time import monotonic, sleep
 
+import flask
+
 # Load API key from ~/.env if not already in environment
 _env_file = Path.home() / '.env'
 if _env_file.exists() and 'OPENAI_API_KEY' not in os.environ:
@@ -121,6 +123,45 @@ AI_JPEG_QUALITY  = 92    # JPEG quality for API image upload (lower = faster)
 # Loop
 LOOP_HZ     = 25
 PRINT_EVERY =  8
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  WEB STREAM  (MJPEG on port 8080 — browse to http://<pi-ip>:8080/stream)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_stream_frame     = None
+_stream_lock      = threading.Lock()
+_stream_flask_app = flask.Flask(__name__)
+
+@_stream_flask_app.route('/')
+def _stream_index():
+    return '<html><body><img src="/stream"></body></html>'
+
+@_stream_flask_app.route('/stream')
+def _stream_feed():
+    def _generate():
+        while True:
+            with _stream_lock:
+                frame = _stream_frame
+            if frame is not None:
+                ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                           + buf.tobytes() + b'\r\n')
+            sleep(0.04)
+    return flask.Response(_generate(),
+                          mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def _start_web_stream():
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    _stream_flask_app.run(host='0.0.0.0', port=8080, threaded=True)
+
+def push_web_frame(frame):
+    global _stream_frame
+    with _stream_lock:
+        _stream_frame = frame
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -267,10 +308,11 @@ class OpenAISignDetector:
     PROMPT = (
         "You are the vision system of a small autonomous robot car driving on a "
         "track. Look at this image from the robot's forward-facing camera. "
-        "Is there a traffic sign visible that indicates which direction to turn "
-        "at the next junction? "
-        "Reply with exactly ONE word — left, right, forward, or none. "
-        "Do not explain. Do not punctuate."
+        "Is there a traffic sign visible? "
+        "If it is a STOP sign, reply: stop. "
+        "If it indicates a direction to turn at the next junction, reply: left, right, or forward. "
+        "If no sign is visible, reply: none. "
+        "Reply with exactly ONE word. Do not explain. Do not punctuate."
     )
 
     RECOVERY_PROMPT = (
@@ -402,7 +444,7 @@ class OpenAISignDetector:
         )
         word    = response.choices[0].message.content.strip().lower()
         elapsed = monotonic() - t0
-        result  = word if word in ('left', 'right', 'forward') else 'none'
+        result  = word if word in ('left', 'right', 'forward', 'stop') else 'none'
         print(f' [AI] {result:>8}  ({elapsed:.1f}s)', flush=True)
         return result
 
@@ -428,6 +470,11 @@ class OpenAISignDetector:
                     self._arm_cnt = max(0, self._arm_cnt - 1)
                     if self._arm_cnt == 0:
                         self._pending = 'none'
+                elif response == 'stop':
+                    # Stop sign arms immediately regardless of threshold
+                    self._pending   = 'stop'
+                    self._arm_cnt   = AI_ARM_THRESHOLD
+                    self._armed_dir = 'stop'
                 elif response == self._pending:
                     self._arm_cnt += 1
                     if self._arm_cnt >= AI_ARM_THRESHOLD:
@@ -481,6 +528,9 @@ class LaneFollower:
         self._recovery_dir      = 0     # +1 right, -1 left
         self._recovery_phase    = None  # 'backup' | 'turn'
         self._recovery_ts       = 0.0
+
+        # Stop sign exit flag
+        self.should_exit = False
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -617,6 +667,12 @@ class LaneFollower:
                 self._i_err          = 0.0
                 self._obstacle_stop_ts = 0.0
                 print(' [RECOVERY] done — resuming', flush=True)
+
+        # ── Stop sign: stop car and signal program exit ───────────────────
+        if armed_dir == 'stop' and self._state == self.NORMAL:
+            print(' [STOP SIGN] detected — stopping and exiting.', flush=True)
+            self.should_exit = True
+            return 0.0, 0, 'STOP SIGN — exiting', frame
 
         # ── Junction latch: fire as soon as AI arms after stripe ─────────
         # The stripe sets _junction_seen; AI response may arrive seconds later.
@@ -774,6 +830,11 @@ def main():
     sleep(0.3)
     print(f' Camera ready: {CAM_W}×{CAM_H} @ {CAM_FPS}fps  tilt={CAM_TILT}°')
 
+    # Web stream
+    _wt = threading.Thread(target=_start_web_stream, daemon=True)
+    _wt.start()
+    print(f' Web stream : http://0.0.0.0:8080/stream  (open in browser)')
+
     # Sign detector
     sign_det = OpenAISignDetector(enabled=not args.no_signs)
     sign_det.start()
@@ -815,6 +876,8 @@ def main():
                 cv2.putText(ann, f'AI:{ai_pending}({ai_cnt}/{AI_ARM_THRESHOLD})', (10, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
 
+            push_web_frame(ann)
+
             px.set_dir_servo_angle(steer)
             if speed == 0:
                 if not stopped:
@@ -823,6 +886,10 @@ def main():
                 px.backward(abs(speed)); stopped = False
             else:
                 px.forward(speed); stopped = False
+
+            if follower.should_exit:
+                print('\n [STOP SIGN] clean exit.', flush=True)
+                break
 
             if cycle % PRINT_EVERY == 0:
                 dist_s = f'{dist:.0f}cm' if dist > 0 else '   ---'
