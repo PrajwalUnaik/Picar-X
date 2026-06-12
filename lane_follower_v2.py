@@ -87,10 +87,10 @@ MAX_STEER  = 28.0   # servo hard limit (degrees)
 STEER_RATE =  7.0   # max change per frame
 
 # Speeds (%)
-SPEED_CRUISE  = 17
-SPEED_CORRECT = 15
-SPEED_CREEP   = 12
-SPEED_TURN    = 16
+SPEED_CRUISE  = 12
+SPEED_CORRECT = 10
+SPEED_CREEP   =  7
+SPEED_TURN    = 11
 
 # Obstacle / sonar
 STOP_DIST          = 15   # cm — full stop
