@@ -103,7 +103,7 @@ GAP_HOLD_DECAY  =  0.97  # per-frame decay of last error during gap
 GAP_JUNCTION_MIN =  5    # camera-gap frames needed before sonar gate is checked
 
 # Turn execution
-TURN_HOLD_SEC         = 2.3    # seconds to hold full steer during a turn
+TURN_HOLD_SEC         = 2.6    # seconds to hold full steer during a turn
 JUNCTION_LATCH_SEC    = 12.0   # seconds to remember a junction stripe before giving up
 JUNCTION_DEFAULT_DIR  = 'right'  # fallback if AI never arms before latch expires
 TURN_COOLDOWN   = 5.0    # seconds after turn before new sign arming is allowed
@@ -123,7 +123,7 @@ AI_JPEG_QUALITY  = 92    # JPEG quality for API image upload (lower = faster)
 
 # Pan scan (active sign query at junction stripe)
 SCAN_PAN_POSITIONS = [-15, 0, 15]  # degrees: left, centre, right
-SCAN_TILT_UP       =  10.0         # tilt up from CAM_TILT to see signs better
+SCAN_TILT_UP       =  15.0         # tilt up from CAM_TILT to see signs better
 
 # Single-line tracking targets — where each lane line appears when car is centred.
 # Calibrated from observed blob positions when both lines visible:
@@ -265,14 +265,25 @@ class LaneDetector:
         left_cx  = weighted_cx(left_blobs)
         right_cx = weighted_cx(right_blobs)
 
+        n_left  = len(left_blobs)
+        n_right = len(right_blobs)
+
         if left_cx is not None and right_cx is not None:
             lane_cx = (left_cx + right_cx) / 2.0
         elif right_cx is not None:
-            # Only right line visible — offset from its calibrated target position
-            lane_cx = right_cx - (LANE_RIGHT_LINE_TARGET - 0.5) * w
+            # ≥2 blobs on right = dashed centre line drifted to right side (car went left)
+            # 1 blob on right = solid outer boundary (normal position)
+            if n_right >= 2:
+                lane_cx = right_cx - (0.5 - LANE_LEFT_LINE_TARGET) * w
+            else:
+                lane_cx = right_cx - (LANE_RIGHT_LINE_TARGET - 0.5) * w
         elif left_cx is not None:
-            # Only left line visible — offset from its calibrated target position
-            lane_cx = left_cx + (0.5 - LANE_LEFT_LINE_TARGET) * w
+            # ≥2 blobs on left = dashed centre line in normal position (correct side)
+            # 1 blob on left = solid boundary appeared on left (car far right)
+            if n_left >= 2:
+                lane_cx = left_cx + (0.5 - LANE_LEFT_LINE_TARGET) * w
+            else:
+                lane_cx = left_cx + (LANE_RIGHT_LINE_TARGET - 0.5) * w
         else:
             self.last_error_valid = False
             return None, 0, {'v_thr': v_thr, 'blobs': 0}, ann
@@ -643,17 +654,18 @@ class LaneFollower:
         ties; 'stop' overrides everything.
         """
         print(' [SCAN] stopping car and starting pan scan...', flush=True)
+        px.set_dir_servo_angle(0)   # straighten wheels so camera faces forward
         px.stop()
-        sleep(0.4)  # let car fully settle before moving camera
+        sleep(0.6)  # let car and camera fully settle
 
         px.set_cam_tilt_angle(CAM_TILT + SCAN_TILT_UP)
-        sleep(0.3)
+        sleep(0.4)
 
         # Capture frames sequentially (camera must physically move)
         frames = []
         for pan in SCAN_PAN_POSITIONS:
             px.set_cam_pan_angle(pan)
-            sleep(0.3)
+            sleep(0.5)  # longer settle for sharp image
             if self._cam is not None:
                 frames.append(self._cam.capture_array())
                 # Save scan frames for debug
