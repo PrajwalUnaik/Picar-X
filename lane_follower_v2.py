@@ -933,7 +933,7 @@ class LaneFollower:
             return 0.0, 0, f'STOP SIGN ({trigger})', frame
 
         self._state    = self.TURNING
-        self._state_ts = now
+        self._state_ts = monotonic()  # fresh timestamp — now may be stale after a blocking scan
         self._turn_dir = +1 if direction == 'right' else -1
         self._i_err    = 0.0
         steer = self._apply_steer(MAX_STEER * self._turn_dir)
