@@ -1,6 +1,6 @@
 # Picar-X Autonomous Line Follower
 
-Autonomous white dashed-line follower for the **SunFounder Picar-X** robot car, running on a Raspberry Pi. Two implementations are provided — a fast grayscale-sensor version and a more accurate camera + OpenCV version.
+Autonomous lane follower for the **SunFounder Picar-X** robot car, running on a Raspberry Pi. The primary implementation (`lane_follower_v2.py`) uses camera-based PID lane keeping, OpenAI Vision sign detection, and active junction handling. Two simpler reference implementations are also included.
 
 ---
 
@@ -9,31 +9,37 @@ Autonomous white dashed-line follower for the **SunFounder Picar-X** robot car, 
 | Component | Details |
 |---|---|
 | Robot | SunFounder Picar-X |
-| Platform | Raspberry Pi (aarch64, hostname `pi-six`) |
+| Platform | Raspberry Pi (aarch64) |
 | MCU | STM32-type onboard HAT at I2C 0x14 (PWM / ADC) |
 | Sensors | 3× grayscale (A0=Left, A1=Middle, A2=Right) |
 | Camera | OV5647, controlled via picamera2 |
 | Distance | HC-SR04 ultrasonic (TRIG=D2, ECHO=D3) |
+| Camera servos | Pan + Tilt controlled via robot-hat |
 
 ---
 
 ## Track Environment
 
+Lollipop / keyhole layout: an oval loop connected to a straight via a junction stripe.
+
 ```
-  ┌─────────────────────────────────────────┐
-  │  Grey carpet (off-road)                 │
-  │  ┌───────────────────────────────────┐  │
-  │  │  Dark foam road surface           │  │
-  │  │    - - - - - - - - - - -          │  │  ← white dashed centre line
-  │  │                                   │  │
-  │  └───────────────────────────────────┘  │
-  │  Grey carpet (off-road)                 │
-  └─────────────────────────────────────────┘
+        ┌──────────────────────────┐
+        │     ╔══════════════╗     │
+        │     ║  oval loop   ║     │
+        │     ╚══════════════╝     │
+        │           │ B1           │
+        │     ══════╪══════        │  ← junction stripe (GS all-white)
+        │           │              │
+        │           │ straight     │
+        │     ══════╪══════        │  ← junction stripe (GS all-white)
+        │           │ B2           │
+        └──────────────────────────┘
 ```
 
-- **White dashed line** — the centre line to follow
-- **Dark foam** — the road surface
-- **Grey carpet** — off-road area to avoid
+- **Solid white lines** — outer lane boundaries
+- **White dashed line** — centre line
+- **Junction stripes** — all-white bands detected by grayscale sensors
+- **Direction signs** — arrow signs at junctions detected by camera + OpenAI
 
 ---
 
@@ -49,13 +55,13 @@ pip3 install -r requirements.txt
 
 ### OpenAI API key (required for `lane_follower_v2.py`)
 
-`lane_follower_v2.py` uses the OpenAI Vision API for sign detection. Create a file at `~/.env` with your key:
+`lane_follower_v2.py` uses the OpenAI Vision API (gpt-4o-mini) for sign detection. Create a file at `~/.env` with your key:
 
 ```
 OPENAI_API_KEY=sk-...your-key-here...
 ```
 
-The script loads this automatically on startup. Without it, sign detection will fail silently (the car will still follow lanes but won't detect directional signs or stop signs).
+The script loads this automatically on startup. Without it, sign detection will fail. Pass `--no-signs` to run lane-following only without the API.
 
 ---
 
@@ -63,9 +69,58 @@ The script loads this automatically on startup. Without it, sign detection will 
 
 | File | Description |
 |---|---|
-| `road_follower.py` | Grayscale sensor-based line follower |
+| `lane_follower_v2.py` | **Recommended** — full autonomous follower with PID, junction handling, OpenAI signs, obstacle recovery |
+| `road_follower.py` | Simple grayscale sensor-based line follower |
 | `cam_follower.py` | Camera + OpenCV + PID line follower |
-| `lane_follower_v2.py` | Full autonomous follower: PID lane keeping, junction detection, OpenAI sign detection (recommended) |
+
+---
+
+## `lane_follower_v2.py` — Full Autonomous Follower (Recommended)
+
+### Features
+
+- **PID lane keeping** — HSV white-mask on camera feed, separate left/right blob tracking
+- **Junction detection** — all 3 grayscale sensors on white simultaneously = junction stripe
+- **Active pan scan** — at junction stripe, car stops, tilts camera up, sweeps ±15°, 3 parallel OpenAI Vision queries, majority vote decides turn direction
+- **Background sign polling** — OpenAI Vision queried every ~1s in background thread; arms turn direction before stripe is reached
+- **Stop sign handling** — AI arms `stop`, fires on GS stripe, clean exit
+- **GS boundary guards** — single sensor on white = lane boundary crossed, hard steer correction
+- **Obstacle recovery** — stuck for 2s → back up 3s → pan scan to decide direction → turn and resume
+- **MJPEG web stream** — live annotated camera feed at `http://<pi-ip>:8080/stream`
+- **Debug photos** — saved to `/tmp/lf_debug/` every 2s and at each junction/scan
+
+### Usage
+
+```bash
+python3 lane_follower_v2.py              # follow right lane (default)
+python3 lane_follower_v2.py --left-lane  # follow left lane
+python3 lane_follower_v2.py --no-signs   # disable OpenAI (lane following only)
+python3 lane_follower_v2.py --cam-tilt -20  # override camera tilt angle
+```
+
+### Key tuning constants
+
+```python
+SPEED_CRUISE  = 12   # % — normal lane-following speed
+SPEED_CORRECT = 10   # % — correcting (off-centre)
+SPEED_CREEP   =  7   # % — slow creep (gap / junction)
+SPEED_TURN    = 11   # % — turning at junction
+
+KP, KI, KD   = 28.0, 0.15, 7.0   # PID gains
+MAX_STEER     = 28.0               # degrees max steering
+TURN_HOLD_SEC =  2.6               # seconds to hold a junction turn
+
+RECOVERY_BACK_SEC  = 3.0   # seconds to reverse before obstacle recovery scan
+JUNCTION_LATCH_SEC = 12.0  # seconds to wait at stripe for AI if scan returns none
+AI_POLL_SEC        =  1.0  # background AI query interval
+```
+
+### State machine
+
+```
+NORMAL → (obstacle 2s) → RECOVERING → (backup 3s + pan scan) → NORMAL
+NORMAL → (GS all-white) → [latch] → (scan / wait AI) → TURNING → NORMAL
+```
 
 ---
 
@@ -94,105 +149,24 @@ The `LineFollower` class maps sensor patterns to steering decisions:
 ### Usage
 
 ```bash
-# Run
 python3 road_follower.py
-
-# Calibrate sensor thresholds
 python3 road_follower.py --calibrate
-
-# Adjust white detection threshold
 python3 road_follower.py --white-thresh 1400
-
-# Correct straight-line drift (negative = correct right-drift)
-python3 road_follower.py --straight-offset -2.0
-```
-
-### Key tuning constants
-
-```python
-WHITE_THRESH  = 1300   # ADC >= this → white line
-FOLLOW_SPEED  = 11     # % — normal following speed
-SEEK_SPEED    = 7      # % — creep speed in gaps between dashes
-STEER_GENTLE  = 12     # degrees — gentle correction
-STEER_SHARP   = 25     # degrees — sharp correction
-GAP_CYCLES    = 4      # frames with no white before seeking
 ```
 
 ---
 
-## `cam_follower.py` — Camera + OpenCV Follower (Recommended)
+## `cam_follower.py` — Camera + OpenCV Follower
 
-Uses the front camera tilted downward to detect the white line with OpenCV, then steers with a PID controller. Far more robust than the grayscale sensors.
-
-### How it works
-
-1. **Camera** captures 320×240 BGR frames at 30fps
-2. **ROI** — only the bottom 45% of the frame (road closest to robot) is analysed
-3. **HSV threshold** — white pixels: Saturation < 50, Value > 190
-4. **Column centre of mass** — finds the horizontal centre of all white pixels → `offset` (-1.0 to +1.0)
-5. **PID controller** — converts offset to steering angle
-6. **Gap detection** — when no white pixels found for 8+ frames, slow to seek speed
-
-```
-Frame (320×240):
-┌────────────────────────────────────────┐
-│                                        │  ← ignored (sky/background)
-│                                        │
-├────────────────────────────────────────┤  ← ROI_TOP (55%)
-│         [analysed region]              │
-│              ●  ← detected line centre │
-│     blue │   green dot                 │
-└────────────────────────────────────────┘
-```
-
-PID formula:
-```
-steer = KP × error + KI × Σerror + KD × Δerror
-```
-Where `error = offset` (how far the line is from frame centre).
+Uses the front camera tilted downward to detect the white line with OpenCV, then steers with a PID controller.
 
 ### Usage
 
 ```bash
-# Run with camera
 python3 cam_follower.py
-
-# Calibrate colour thresholds (point at white then grey)
-python3 cam_follower.py --calibrate
-
-# Adjust camera tilt angle (more negative = looks further down)
 python3 cam_follower.py --cam-tilt -25
-
-# Save annotated frames for debugging
 python3 cam_follower.py --save-frames
-# Frames saved to /tmp/cam_debug/fNNNNN.jpg
-
-# Override colour thresholds
-python3 cam_follower.py --white-v 180 --white-s 60
 ```
-
-### Key tuning constants
-
-```python
-CAM_TILT     = -30.0   # degrees — camera tilt (negative = look down)
-WHITE_V_MIN  = 190     # minimum HSV brightness for white
-WHITE_S_MAX  =  50     # maximum HSV saturation for white
-ROI_TOP      = 0.55    # use bottom 45% of frame
-MIN_WHITE_PX = 200     # minimum pixels to count as "line found"
-KP           = 28.0    # PID proportional gain
-KI           =  0.8    # PID integral gain
-KD           =  4.0    # PID derivative gain
-FOLLOW_SPEED =  11     # % — normal speed
-SEEK_SPEED   =   7     # % — gap creep speed
-```
-
-### Tuning guide
-
-**Camera angle** (`--cam-tilt`): Start at -30°. If the robot can't see the line at all, try -25°. If it sees too far ahead and misses nearby line, try -35°.
-
-**White threshold** (`--white-v`, `--white-s`): Run `--calibrate` and note the HSV V value of the white dash. Set `WHITE_V_MIN` about 20 below that value. Ensure grey carpet gives a V value well below `WHITE_V_MIN`.
-
-**PID gains**: If the robot oscillates (wobbles left-right), reduce `KP` or increase `KD`. If it's slow to correct, increase `KP`.
 
 ---
 
@@ -200,79 +174,44 @@ SEEK_SPEED   =   7     # % — gap creep speed
 
 ### Direction servo (straight-line drift)
 
-If the robot drifts left or right when going straight:
-
 ```bash
 python3 /home/admin/picar-x/example/1.cali_servo_motor.py
 ```
 
 - Press `1` to select the direction servo
-- Press `W`/`S` to increase/decrease the offset
+- Press `W`/`S` to adjust offset
 - Press `SPACE` then `Y` to save
 
-Current calibration stored in `/opt/picar-x/picar-x.conf`.
+Calibration stored in `/opt/picar-x/picar-x.conf`.
 
 ### Motor direction
 
-If a motor runs backwards (robot spins in place), check:
-```
-picarx_dir_motor = [1, 1]   # both normal
-```
-If one is `-1`, run `1.cali_servo_motor.py` and press `Q` on that motor to flip it back.
-
----
-
-## `lane_follower_v2.py` — Full Autonomous Follower (Recommended)
-
-Camera + PID lane keeping with OpenAI Vision sign detection, active pan-scan at junctions, and grayscale sensor guards.
-
-### Usage
-
-```bash
-python3 lane_follower_v2.py              # follow right lane (default)
-python3 lane_follower_v2.py --left-lane  # follow left lane
-python3 lane_follower_v2.py --no-signs   # disable OpenAI (lane following only)
-python3 lane_follower_v2.py --cam-tilt -20  # override camera tilt angle
-```
-
-Live camera feed available at `http://<pi-ip>:8080/stream` once running.
-
-### Key tuning constants
-
-```python
-SPEED_CRUISE  = 17   # % — normal lane-following speed
-SPEED_CORRECT = 15   # % — correcting (off-centre)
-SPEED_CREEP   = 12   # % — slow creep (gap / junction)
-SPEED_TURN    = 16   # % — turning at junction
-KP, KI, KD   = 28.0, 0.15, 7.0   # PID gains
-MAX_STEER     = 28.0              # degrees max steering
-TURN_HOLD_SEC = 2.6               # seconds to hold a junction turn
-```
+If a motor runs backwards, check `picarx_dir_motor = [1, 1]` in the conf file. Run the calibration script and press `Q` on the affected motor to flip it.
 
 ---
 
 ## Software Stack
 
 ```
-cam_follower.py / road_follower.py
+lane_follower_v2.py
         │
-        ├── picarx (v2.1.0a1)     robot-specific layer
-        │       └── robot_hat (v2.5.3)  hardware abstraction
-        │               └── lgpio / smbus2  GPIO + I2C
+        ├── picarx (v2.1.0a1)       robot-specific layer
+        │       └── robot_hat        hardware abstraction (GPIO, I2C, servos)
         │
-        ├── picamera2 (v0.3.36)   camera capture
-        └── OpenCV (v4.10.0)      image processing
+        ├── picamera2 (v0.3.36)     camera capture
+        ├── OpenCV (v4.10.0)        image processing / HSV masking
+        ├── openai (v2.41.1)        Vision API for sign detection
+        └── flask (v3.1.1)          MJPEG web stream
 ```
 
 ---
 
 ## Stopping the Robot
 
-Always use **Ctrl+C** (not Ctrl+Z) to stop. Ctrl+Z suspends the Python process without running the `finally` block, so the motors keep running.
+Always use **Ctrl+C** to stop — never Ctrl+Z (suspends without stopping motors).
 
-If the robot is still running after Ctrl+C fails:
+If the process won't stop:
 ```bash
-pkill -f cam_follower
-pkill -f road_follower
+pkill -f lane_follower_v2
 python3 -c "from picarx import Picarx; px=Picarx(); px.stop()"
 ```
