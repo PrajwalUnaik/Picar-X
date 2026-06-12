@@ -37,12 +37,35 @@ Autonomous white dashed-line follower for the **SunFounder Picar-X** robot car, 
 
 ---
 
+## Setup
+
+### Python dependencies
+
+```bash
+pip3 install -r requirements.txt
+```
+
+> OpenCV and the `picarx`/`robot-hat` libraries are not on PyPI — they are pre-installed on Raspberry Pi OS and provided as local submodules in this repo respectively.
+
+### OpenAI API key (required for `lane_follower_v2.py`)
+
+`lane_follower_v2.py` uses the OpenAI Vision API for sign detection. Create a file at `~/.env` with your key:
+
+```
+OPENAI_API_KEY=sk-...your-key-here...
+```
+
+The script loads this automatically on startup. Without it, sign detection will fail silently (the car will still follow lanes but won't detect directional signs or stop signs).
+
+---
+
 ## Files
 
 | File | Description |
 |---|---|
 | `road_follower.py` | Grayscale sensor-based line follower |
-| `cam_follower.py` | Camera + OpenCV + PID line follower (recommended) |
+| `cam_follower.py` | Camera + OpenCV + PID line follower |
+| `lane_follower_v2.py` | Full autonomous follower: PID lane keeping, junction detection, OpenAI sign detection (recommended) |
 
 ---
 
@@ -196,6 +219,35 @@ If a motor runs backwards (robot spins in place), check:
 picarx_dir_motor = [1, 1]   # both normal
 ```
 If one is `-1`, run `1.cali_servo_motor.py` and press `Q` on that motor to flip it back.
+
+---
+
+## `lane_follower_v2.py` — Full Autonomous Follower (Recommended)
+
+Camera + PID lane keeping with OpenAI Vision sign detection, active pan-scan at junctions, and grayscale sensor guards.
+
+### Usage
+
+```bash
+python3 lane_follower_v2.py              # follow right lane (default)
+python3 lane_follower_v2.py --left-lane  # follow left lane
+python3 lane_follower_v2.py --no-signs   # disable OpenAI (lane following only)
+python3 lane_follower_v2.py --cam-tilt -20  # override camera tilt angle
+```
+
+Live camera feed available at `http://<pi-ip>:8080/stream` once running.
+
+### Key tuning constants
+
+```python
+SPEED_CRUISE  = 17   # % — normal lane-following speed
+SPEED_CORRECT = 15   # % — correcting (off-centre)
+SPEED_CREEP   = 12   # % — slow creep (gap / junction)
+SPEED_TURN    = 16   # % — turning at junction
+KP, KI, KD   = 28.0, 0.15, 7.0   # PID gains
+MAX_STEER     = 28.0              # degrees max steering
+TURN_HOLD_SEC = 2.6               # seconds to hold a junction turn
+```
 
 ---
 

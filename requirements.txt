@@ -1,0 +1,6 @@
+openai>=2.41.1
+flask>=3.1.1
+numpy>=2.2.4
+picamera2>=0.3.36
+# opencv is pre-installed system-wide on Raspberry Pi OS — no pip install needed
+# picarx and robot-hat are installed from the local submodules in this repo
