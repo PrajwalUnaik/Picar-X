@@ -23,6 +23,7 @@ Usage:
 
 import argparse
 import base64
+import concurrent.futures
 import os
 import threading
 from pathlib import Path
@@ -102,8 +103,8 @@ GAP_HOLD_DECAY  =  0.97  # per-frame decay of last error during gap
 GAP_JUNCTION_MIN =  5    # camera-gap frames needed before sonar gate is checked
 
 # Turn execution
-TURN_HOLD_SEC         = 2.3   # seconds to hold full steer during a turn
-JUNCTION_LATCH_SEC    = 6.0   # seconds to remember a junction stripe before giving up
+TURN_HOLD_SEC         = 2.3    # seconds to hold full steer during a turn
+JUNCTION_LATCH_SEC    = 12.0   # seconds to remember a junction stripe before giving up
 JUNCTION_DEFAULT_DIR  = 'right'  # fallback if AI never arms before latch expires
 TURN_COOLDOWN   = 5.0    # seconds after turn before new sign arming is allowed
 STOP_HOLD_SEC   = 3.0    # seconds to pause at a stop sign
@@ -122,10 +123,19 @@ AI_JPEG_QUALITY  = 92    # JPEG quality for API image upload (lower = faster)
 
 # Pan scan (active sign query at junction stripe)
 SCAN_PAN_POSITIONS = [-15, 0, 15]  # degrees: left, centre, right
-SCAN_TILT_UP       =   5.0         # tilt up from CAM_TILT to see signs better
+SCAN_TILT_UP       =  10.0         # tilt up from CAM_TILT to see signs better
+
+# Single-line tracking targets — where each lane line appears when car is centred.
+# Calibrated from observed blob positions when both lines visible:
+#   left_cx ≈ 25% of frame width,  right_cx ≈ 90% of frame width
+LANE_LEFT_LINE_TARGET  = 0.25   # fraction of frame width
+LANE_RIGHT_LINE_TARGET = 0.90   # fraction of frame width
 
 # Lane orientation detection (solid line should be on right)
 ORIENTATION_WARN_FRAMES = 20  # consecutive wrong-orientation frames before warning
+
+# Timed photo save for analysis
+PHOTO_INTERVAL_SEC = 2.0
 
 # Loop
 LOOP_HZ     = 25
@@ -257,10 +267,12 @@ class LaneDetector:
 
         if left_cx is not None and right_cx is not None:
             lane_cx = (left_cx + right_cx) / 2.0
-        elif left_cx is not None:
-            lane_cx = (left_cx + w) / 2.0
         elif right_cx is not None:
-            lane_cx = right_cx / 2.0
+            # Only right line visible — offset from its calibrated target position
+            lane_cx = right_cx - (LANE_RIGHT_LINE_TARGET - 0.5) * w
+        elif left_cx is not None:
+            # Only left line visible — offset from its calibrated target position
+            lane_cx = left_cx + (0.5 - LANE_LEFT_LINE_TARGET) * w
         else:
             self.last_error_valid = False
             return None, 0, {'v_thr': v_thr, 'blobs': 0}, ann
@@ -626,30 +638,46 @@ class LaneFollower:
 
     def _pan_scan_for_sign(self, sign_det: 'OpenAISignDetector') -> str:
         """
-        Tilt camera up 5°, sweep pan left/centre/right, query AI at each position.
-        Returns majority-voted direction; centre position breaks ties; 'stop' wins always.
+        Stop the car, tilt camera up, sweep pan L/C/R capturing one frame each,
+        then query AI on all 3 frames in parallel. Majority vote; centre breaks
+        ties; 'stop' overrides everything.
         """
-        print(' [SCAN] starting pan scan (tilt up, sweep L/C/R)...', flush=True)
+        print(' [SCAN] stopping car and starting pan scan...', flush=True)
+        px.stop()
+        sleep(0.4)  # let car fully settle before moving camera
+
         px.set_cam_tilt_angle(CAM_TILT + SCAN_TILT_UP)
         sleep(0.3)
 
-        results = []
+        # Capture frames sequentially (camera must physically move)
+        frames = []
         for pan in SCAN_PAN_POSITIONS:
             px.set_cam_pan_angle(pan)
-            sleep(0.25)
+            sleep(0.3)
             if self._cam is not None:
-                frame = self._cam.capture_array()
+                frames.append(self._cam.capture_array())
+                # Save scan frames for debug
+                os.makedirs('/tmp/lf_debug', exist_ok=True)
+                cv2.imwrite(f'/tmp/lf_debug/scan_pan{pan:+d}.jpg', frames[-1])
             else:
-                results.append('none')
-                continue
-            result = sign_det.call_sign_scan(frame)
-            results.append(result)
-            print(f' [SCAN] pan={pan:+d}° → {result}', flush=True)
+                frames.append(None)
 
-        # Restore camera position
+        # Restore camera before API calls (car can track lane again once scan returns)
         px.set_cam_pan_angle(CAM_PAN)
         px.set_cam_tilt_angle(CAM_TILT)
         sleep(0.3)
+
+        # Query AI on all 3 frames in parallel
+        def _query(frame):
+            if frame is None:
+                return 'none'
+            return sign_det.call_sign_scan(frame)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            results = list(ex.map(_query, frames))
+
+        for pan, r in zip(SCAN_PAN_POSITIONS, results):
+            print(f' [SCAN] pan={pan:+d}° → {r}', flush=True)
 
         # stop beats everything
         if 'stop' in results:
@@ -701,6 +729,7 @@ class LaneFollower:
                 print(f' [RECOVERY] attempt {self._recovery_attempts}/{RECOVERY_MAX_TRIES} — backing up', flush=True)
                 return 0.0, -SPEED_CREEP, 'RECOVERY start', frame
             tag = 'RECOVERY EXHAUSTED' if self._recovery_attempts >= RECOVERY_MAX_TRIES else f'stuck {stopped_for:.1f}s'
+            self._gap_cnt = 0  # don't accumulate gap count while stopped
             return 0.0, 0, f'OBSTACLE {dist:.0f}cm  {tag}', frame
         elif self._state == self.NORMAL and self._obstacle_stop_ts != 0.0:
             self._obstacle_stop_ts  = 0.0
@@ -966,10 +995,13 @@ def main():
     print(hdr)
     print(' ' + '─' * (len(hdr) - 1))
 
-    cycle    = 0
-    save_cyc = 0
-    stopped  = False
-    period   = 1.0 / LOOP_HZ
+    cycle         = 0
+    save_cyc      = 0
+    stopped       = False
+    period        = 1.0 / LOOP_HZ
+    last_photo_ts = 0.0
+    photo_idx     = 0
+    os.makedirs('/tmp/lf_debug', exist_ok=True)
 
     try:
         while True:
@@ -1008,6 +1040,12 @@ def main():
             if follower.should_exit:
                 print('\n [STOP SIGN] clean exit.', flush=True)
                 break
+
+            # Timed photo save — always on, every PHOTO_INTERVAL_SEC
+            if (monotonic() - last_photo_ts) >= PHOTO_INTERVAL_SEC:
+                cv2.imwrite(f'/tmp/lf_debug/photo_{photo_idx:04d}.jpg', ann)
+                last_photo_ts = monotonic()
+                photo_idx += 1
 
             if cycle % PRINT_EVERY == 0:
                 dist_s = f'{dist:.0f}cm' if dist > 0 else '   ---'
