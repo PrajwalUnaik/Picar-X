@@ -112,7 +112,7 @@ STOP_HOLD_SEC   = 3.0    # seconds to pause at a stop sign
 # Stuck recovery
 RECOVERY_SONAR_CM    = 14    # cm — only recover when this close (tighter than STOP_DIST)
 RECOVERY_TRIGGER_SEC =  2.0  # seconds stopped before recovery begins
-RECOVERY_BACK_SEC    =  0.7  # seconds to reverse before AI recovery call
+RECOVERY_BACK_SEC    =  3.0  # seconds to reverse before pan scan + recovery turn
 RECOVERY_TURN_SEC    =  1.5  # seconds to turn during recovery
 RECOVERY_MAX_TRIES   =  2    # max attempts per stuck event before giving up
 
@@ -778,20 +778,23 @@ class LaneFollower:
             if self._recovery_phase == 'backup':
                 if elapsed < RECOVERY_BACK_SEC:
                     return 0.0, -SPEED_CREEP, f'RECOVERY backup {elapsed:.1f}s', frame
-                # Backup done — pick direction from last known lane error (no AI call)
+                # Backup done — pan scan to decide which way to go
                 px.stop()
                 sleep(0.2)
-                if self._recovery_attempts == 1:
-                    # Use the same direction as the last junction turn so the car
-                    # re-enters the curve it was navigating. _turn_dir: +1=right, -1=left.
+                print(f' [RECOVERY] backup done — pan scanning for direction...', flush=True)
+                scanned = self._pan_scan_for_sign(sign_det)
+                if scanned in ('left', 'right'):
+                    rec_dir = scanned
+                    print(f' [RECOVERY] scan → {rec_dir}', flush=True)
+                elif self._recovery_attempts == 1:
                     rec_dir = 'right' if self._turn_dir >= 0 else 'left'
-                    print(f' [RECOVERY] attempt 1: last_turn={self._turn_dir:+d} → {rec_dir}', flush=True)
+                    print(f' [RECOVERY] scan=none, fallback last_turn={self._turn_dir:+d} → {rec_dir}', flush=True)
                 else:
                     rec_dir = 'left' if self._recovery_dir > 0 else 'right'
-                    print(f' [RECOVERY] attempt {self._recovery_attempts}: flipping to {rec_dir}', flush=True)
+                    print(f' [RECOVERY] scan=none, attempt {self._recovery_attempts}: flipping to {rec_dir}', flush=True)
                 self._recovery_dir   = +1 if rec_dir == 'right' else -1
                 self._recovery_phase = 'turn'
-                self._recovery_ts    = now
+                self._recovery_ts    = monotonic()  # fresh — pan scan blocked for ~3s
             if self._recovery_phase == 'turn':
                 elapsed = now - self._recovery_ts
                 if elapsed < RECOVERY_TURN_SEC:
@@ -933,7 +936,7 @@ class LaneFollower:
             return 0.0, 0, f'STOP SIGN ({trigger})', frame
 
         self._state    = self.TURNING
-        self._state_ts = now
+        self._state_ts = monotonic()  # fresh timestamp — now may be stale after a blocking scan
         self._turn_dir = +1 if direction == 'right' else -1
         self._i_err    = 0.0
         steer = self._apply_steer(MAX_STEER * self._turn_dir)
