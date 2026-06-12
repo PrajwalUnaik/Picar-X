@@ -23,10 +23,13 @@ Usage:
 
 import argparse
 import base64
+import concurrent.futures
 import os
 import threading
 from pathlib import Path
 from time import monotonic, sleep
+
+import flask
 
 # Load API key from ~/.env if not already in environment
 _env_file = Path.home() / '.env'
@@ -60,12 +63,12 @@ WHITE_S_MAX  =  60
 ADAPTIVE_K   =  0.20
 
 # Lane ROI (fraction of frame height) — tuned for CAM_TILT = -15°
-LANE_ROI_TOP = 0.42
+LANE_ROI_TOP = 0.30
 LANE_ROI_BOT = 0.82
 
 # Sign ROI — upper portion where signs appear ahead of car
 SIGN_ROI_TOP = 0.00
-SIGN_ROI_BOT = 0.45
+SIGN_ROI_BOT = 0.65
 
 # Lane blob filters
 MIN_CONTOUR_AREA = 200
@@ -75,19 +78,19 @@ MIN_ASPECT_RATIO = 0.8
 GS_WHITE_THRESHOLD = 600
 
 # PID
-KP = 22.0
+KP = 28.0
 KI =  0.15
 KD =  7.0
 
 # Steering
-MAX_STEER  = 25.0   # servo hard limit (degrees)
+MAX_STEER  = 28.0   # servo hard limit (degrees)
 STEER_RATE =  7.0   # max change per frame
 
 # Speeds (%)
-SPEED_CRUISE  = 14
+SPEED_CRUISE  = 12
 SPEED_CORRECT = 10
 SPEED_CREEP   =  7
-SPEED_TURN    = 10
+SPEED_TURN    = 11
 
 # Obstacle / sonar
 STOP_DIST          = 15   # cm — full stop
@@ -100,20 +103,82 @@ GAP_HOLD_DECAY  =  0.97  # per-frame decay of last error during gap
 GAP_JUNCTION_MIN =  5    # camera-gap frames needed before sonar gate is checked
 
 # Turn execution
-TURN_HOLD_SEC         = 2.2   # seconds to hold full steer during a turn
-JUNCTION_LATCH_SEC    = 6.0   # seconds to remember a junction stripe before giving up
+TURN_HOLD_SEC         = 2.6    # seconds to hold full steer during a turn
+JUNCTION_LATCH_SEC    = 12.0   # seconds to remember a junction stripe before giving up
 JUNCTION_DEFAULT_DIR  = 'right'  # fallback if AI never arms before latch expires
 TURN_COOLDOWN   = 5.0    # seconds after turn before new sign arming is allowed
 STOP_HOLD_SEC   = 3.0    # seconds to pause at a stop sign
 
+# Stuck recovery
+RECOVERY_SONAR_CM    = 14    # cm — only recover when this close (tighter than STOP_DIST)
+RECOVERY_TRIGGER_SEC =  2.0  # seconds stopped before recovery begins
+RECOVERY_BACK_SEC    =  0.7  # seconds to reverse before AI recovery call
+RECOVERY_TURN_SEC    =  1.5  # seconds to turn during recovery
+RECOVERY_MAX_TRIES   =  2    # max attempts per stuck event before giving up
+
 # OpenAI sign detector
 AI_POLL_SEC      = 1.0   # seconds between API calls (after ~1s API latency = ~2s cycle)
 AI_ARM_THRESHOLD =  1    # responses to arm; stripe is the physical gate so 1 is safe
-AI_JPEG_QUALITY  = 70    # JPEG quality for API image upload (lower = faster)
+AI_JPEG_QUALITY  = 92    # JPEG quality for API image upload (lower = faster)
+
+# Pan scan (active sign query at junction stripe)
+SCAN_PAN_POSITIONS = [-15, 0, 15]  # degrees: left, centre, right
+SCAN_TILT_UP       =  15.0         # tilt up from CAM_TILT to see signs better
+
+# Single-line tracking targets — where each lane line appears when car is centred.
+# Calibrated from observed blob positions when both lines visible:
+#   left_cx ≈ 25% of frame width,  right_cx ≈ 90% of frame width
+LANE_LEFT_LINE_TARGET  = 0.25   # fraction of frame width
+LANE_RIGHT_LINE_TARGET = 0.90   # fraction of frame width
+
+# Lane orientation detection (solid line should be on right)
+ORIENTATION_WARN_FRAMES = 20  # consecutive wrong-orientation frames before warning
+
+# Timed photo save for analysis
+PHOTO_INTERVAL_SEC = 2.0
 
 # Loop
 LOOP_HZ     = 25
 PRINT_EVERY =  8
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  WEB STREAM  (MJPEG on port 8080 — browse to http://<pi-ip>:8080/stream)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_stream_frame     = None
+_stream_lock      = threading.Lock()
+_stream_flask_app = flask.Flask(__name__)
+
+@_stream_flask_app.route('/')
+def _stream_index():
+    return '<html><body><img src="/stream"></body></html>'
+
+@_stream_flask_app.route('/stream')
+def _stream_feed():
+    def _generate():
+        while True:
+            with _stream_lock:
+                frame = _stream_frame
+            if frame is not None:
+                ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
+                           + buf.tobytes() + b'\r\n')
+            sleep(0.04)
+    return flask.Response(_generate(),
+                          mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def _start_web_stream():
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    _stream_flask_app.run(host='0.0.0.0', port=8080, threaded=True)
+
+def push_web_frame(frame):
+    global _stream_frame
+    with _stream_lock:
+        _stream_frame = frame
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -200,12 +265,25 @@ class LaneDetector:
         left_cx  = weighted_cx(left_blobs)
         right_cx = weighted_cx(right_blobs)
 
+        n_left  = len(left_blobs)
+        n_right = len(right_blobs)
+
         if left_cx is not None and right_cx is not None:
             lane_cx = (left_cx + right_cx) / 2.0
-        elif left_cx is not None:
-            lane_cx = (left_cx + w) / 2.0
         elif right_cx is not None:
-            lane_cx = right_cx / 2.0
+            # ≥2 blobs on right = dashed centre line drifted to right side (car went left)
+            # 1 blob on right = solid outer boundary (normal position)
+            if n_right >= 2:
+                lane_cx = right_cx - (0.5 - LANE_LEFT_LINE_TARGET) * w
+            else:
+                lane_cx = right_cx - (LANE_RIGHT_LINE_TARGET - 0.5) * w
+        elif left_cx is not None:
+            # ≥2 blobs on left = dashed centre line in normal position (correct side)
+            # 1 blob on left = solid boundary appeared on left (car far right)
+            if n_left >= 2:
+                lane_cx = left_cx + (0.5 - LANE_LEFT_LINE_TARGET) * w
+            else:
+                lane_cx = left_cx + (LANE_RIGHT_LINE_TARGET - 0.5) * w
         else:
             self.last_error_valid = False
             return None, 0, {'v_thr': v_thr, 'blobs': 0}, ann
@@ -233,9 +311,12 @@ class LaneDetector:
                     (6, y0 + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 200), 1)
 
         total_px = sum(b['area'] for b in blobs)
+        left_max_area  = max((b['area'] for b in left_blobs),  default=0)
+        right_max_area = max((b['area'] for b in right_blobs), default=0)
         dbg = {
             'v_thr': v_thr, 'blobs': len(blobs),
             'left_cx': left_cx, 'right_cx': right_cx, 'lane_cx': lane_cx,
+            'left_max_area': left_max_area, 'right_max_area': right_max_area,
         }
         self.last_error_valid = True
         return error, total_px, dbg, ann
@@ -260,10 +341,18 @@ class OpenAISignDetector:
     PROMPT = (
         "You are the vision system of a small autonomous robot car driving on a "
         "track. Look at this image from the robot's forward-facing camera. "
-        "Is there a traffic sign visible that indicates which direction to turn "
-        "at the next junction? "
-        "Reply with exactly ONE word — left, right, forward, or none. "
-        "Do not explain. Do not punctuate."
+        "Is there a traffic sign visible? "
+        "If it is a STOP sign, reply: stop. "
+        "If it indicates a direction to turn at the next junction, reply: left, right, or forward. "
+        "If no sign is visible, reply: none. "
+        "Reply with exactly ONE word. Do not explain. Do not punctuate."
+    )
+
+    RECOVERY_PROMPT = (
+        "A small robot car has stopped against an obstacle on a road track and has "
+        "reversed slightly to get clearance. Looking at this camera image, should "
+        "the robot turn LEFT or RIGHT to get back onto the road lane? "
+        "Reply with exactly ONE word — left or right. Do not explain. Do not punctuate."
     )
 
     def __init__(self, enabled: bool = True):
@@ -319,6 +408,70 @@ class OpenAISignDetector:
             self._arm_cnt   = 0
             self._armed_dir = 'none'
 
+    def call_recovery(self, frame) -> str:
+        """Synchronous blocking call — asks AI which way to turn after backing away from obstacle."""
+        if not self._enabled or self._client is None:
+            return 'right'
+        b64 = self._frame_to_b64(frame)
+        if not b64:
+            return 'right'
+        try:
+            t0 = monotonic()
+            response = self._client.chat.completions.create(
+                model      = 'gpt-4o-mini',
+                max_tokens = 5,
+                timeout    = 8.0,
+                messages   = [{
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text',      'text': self.RECOVERY_PROMPT},
+                        {'type': 'image_url', 'image_url': {
+                            'url':    f'data:image/jpeg;base64,{b64}',
+                            'detail': 'low',
+                        }},
+                    ],
+                }],
+            )
+            word    = response.choices[0].message.content.strip().lower()
+            elapsed = monotonic() - t0
+            result  = word if word in ('left', 'right') else 'right'
+            print(f' [AI-RECOVERY] {result}  ({elapsed:.1f}s)', flush=True)
+            return result
+        except Exception as e:
+            print(f' [AI-RECOVERY] error: {e} — defaulting right', flush=True)
+            return 'right'
+
+    def call_sign_scan(self, frame) -> str:
+        """Synchronous single-frame sign query — used during active pan scan at junction."""
+        if not self._enabled or self._client is None:
+            return 'none'
+        h, w = frame.shape[:2]
+        roi  = frame[int(h * SIGN_ROI_TOP):int(h * SIGN_ROI_BOT), :]
+        b64  = self._frame_to_b64(roi)
+        if not b64:
+            return 'none'
+        try:
+            response = self._client.chat.completions.create(
+                model      = 'gpt-4o-mini',
+                max_tokens = 5,
+                timeout    = 8.0,
+                messages   = [{
+                    'role': 'user',
+                    'content': [
+                        {'type': 'text',      'text': self.PROMPT},
+                        {'type': 'image_url', 'image_url': {
+                            'url':    f'data:image/jpeg;base64,{b64}',
+                            'detail': 'low',
+                        }},
+                    ],
+                }],
+            )
+            word = response.choices[0].message.content.strip().lower()
+            return word if word in ('left', 'right', 'forward', 'stop') else 'none'
+        except Exception as e:
+            print(f' [SCAN] API error: {e}', flush=True)
+            return 'none'
+
     # ── Internal ─────────────────────────────────────────────────────────────
 
     def _frame_to_b64(self, frame) -> str:
@@ -355,7 +508,7 @@ class OpenAISignDetector:
         )
         word    = response.choices[0].message.content.strip().lower()
         elapsed = monotonic() - t0
-        result  = word if word in ('left', 'right', 'forward') else 'none'
+        result  = word if word in ('left', 'right', 'forward', 'stop') else 'none'
         print(f' [AI] {result:>8}  ({elapsed:.1f}s)', flush=True)
         return result
 
@@ -381,6 +534,11 @@ class OpenAISignDetector:
                     self._arm_cnt = max(0, self._arm_cnt - 1)
                     if self._arm_cnt == 0:
                         self._pending = 'none'
+                elif response == 'stop':
+                    # Stop sign arms immediately regardless of threshold
+                    self._pending   = 'stop'
+                    self._arm_cnt   = AI_ARM_THRESHOLD
+                    self._armed_dir = 'stop'
                 elif response == self._pending:
                     self._arm_cnt += 1
                     if self._arm_cnt >= AI_ARM_THRESHOLD:
@@ -401,12 +559,14 @@ class OpenAISignDetector:
 
 class LaneFollower:
 
-    NORMAL    = 'NORMAL'
-    TURNING   = 'TURNING'
-    STOP_HELD = 'STOP_HELD'
+    NORMAL     = 'NORMAL'
+    TURNING    = 'TURNING'
+    STOP_HELD  = 'STOP_HELD'
+    RECOVERING = 'RECOVERING'
 
-    def __init__(self, drive_left_lane: bool = False):
+    def __init__(self, drive_left_lane: bool = False, cam=None):
         self._detector = LaneDetector(drive_left_lane)
+        self._cam      = cam
 
         # PID
         self._steer    = 0.0
@@ -426,6 +586,20 @@ class LaneFollower:
         # Junction latch — persists after stripe until AI responds or timeout
         self._junction_seen = False
         self._junction_ts   = 0.0
+        self._scan_done     = False  # pan scan fired once per junction latch
+
+        # Lane orientation detection
+        self._orientation_bad_count = 0
+
+        # Stuck recovery
+        self._obstacle_stop_ts  = 0.0   # when current obstacle stop started (0 = not stopped)
+        self._recovery_attempts = 0     # attempts for current stuck event
+        self._recovery_dir      = 0     # +1 right, -1 left
+        self._recovery_phase    = None  # 'backup' | 'turn'
+        self._recovery_ts       = 0.0
+
+        # Stop sign exit flag
+        self.should_exit = False
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -473,6 +647,72 @@ class LaneFollower:
     def _in_cooldown(self) -> bool:
         return (monotonic() - self._last_turn_end) < TURN_COOLDOWN
 
+    def _pan_scan_for_sign(self, sign_det: 'OpenAISignDetector') -> str:
+        """
+        Stop the car, tilt camera up, sweep pan L/C/R capturing one frame each,
+        then query AI on all 3 frames in parallel. Majority vote; centre breaks
+        ties; 'stop' overrides everything.
+        """
+        print(' [SCAN] stopping car and starting pan scan...', flush=True)
+        px.set_dir_servo_angle(0)   # straighten wheels so camera faces forward
+        px.stop()
+        sleep(0.6)  # let car and camera fully settle
+
+        px.set_cam_tilt_angle(CAM_TILT + SCAN_TILT_UP)
+        sleep(0.4)
+
+        # Capture frames sequentially (camera must physically move)
+        frames = []
+        for pan in SCAN_PAN_POSITIONS:
+            px.set_cam_pan_angle(pan)
+            sleep(0.5)  # longer settle for sharp image
+            if self._cam is not None:
+                frames.append(self._cam.capture_array())
+                # Save scan frames for debug
+                os.makedirs('/tmp/lf_debug', exist_ok=True)
+                cv2.imwrite(f'/tmp/lf_debug/scan_pan{pan:+d}.jpg', frames[-1])
+            else:
+                frames.append(None)
+
+        # Restore camera before API calls (car can track lane again once scan returns)
+        px.set_cam_pan_angle(CAM_PAN)
+        px.set_cam_tilt_angle(CAM_TILT)
+        sleep(0.3)
+
+        # Query AI on all 3 frames in parallel
+        def _query(frame):
+            if frame is None:
+                return 'none'
+            return sign_det.call_sign_scan(frame)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            results = list(ex.map(_query, frames))
+
+        for pan, r in zip(SCAN_PAN_POSITIONS, results):
+            print(f' [SCAN] pan={pan:+d}° → {r}', flush=True)
+
+        # stop beats everything
+        if 'stop' in results:
+            print(f' [SCAN] result=stop (safety override)  all={results}', flush=True)
+            return 'stop'
+
+        # Majority vote among non-none answers
+        counts: dict[str, int] = {}
+        for r in results:
+            if r != 'none':
+                counts[r] = counts.get(r, 0) + 1
+
+        if counts:
+            best = max(counts, key=counts.get)
+            if counts[best] >= 2:
+                print(f' [SCAN] result={best} (majority {counts[best]}/3)  all={results}', flush=True)
+                return best
+
+        # All different or all none — trust centre position (index 1)
+        centre = results[1] if len(results) > 1 else 'none'
+        print(f' [SCAN] result={centre} (centre fallback)  all={results}', flush=True)
+        return centre
+
     # ── Main decision ─────────────────────────────────────────────────────────
 
     def decide(self, frame, gs, dist, armed_dir: str, sign_det: OpenAISignDetector):
@@ -487,7 +727,25 @@ class LaneFollower:
 
         # ── Hard stop (obstacle very close) — suppressed at junction ─────
         if 0 < dist < STOP_DIST and self._state == self.NORMAL and not self._junction_seen:
-            return 0.0, 0, f'OBSTACLE stop ({dist:.0f}cm)', frame
+            if self._obstacle_stop_ts == 0.0:
+                self._obstacle_stop_ts = now
+            stopped_for = now - self._obstacle_stop_ts
+            if (dist <= RECOVERY_SONAR_CM
+                    and stopped_for >= RECOVERY_TRIGGER_SEC
+                    and self._recovery_attempts < RECOVERY_MAX_TRIES):
+                self._recovery_attempts += 1
+                self._recovery_phase = 'backup'
+                self._recovery_ts    = now
+                self._state          = self.RECOVERING
+                self._junction_seen  = False
+                print(f' [RECOVERY] attempt {self._recovery_attempts}/{RECOVERY_MAX_TRIES} — backing up', flush=True)
+                return 0.0, -SPEED_CREEP, 'RECOVERY start', frame
+            tag = 'RECOVERY EXHAUSTED' if self._recovery_attempts >= RECOVERY_MAX_TRIES else f'stuck {stopped_for:.1f}s'
+            self._gap_cnt = 0  # don't accumulate gap count while stopped
+            return 0.0, 0, f'OBSTACLE {dist:.0f}cm  {tag}', frame
+        elif self._state == self.NORMAL and self._obstacle_stop_ts != 0.0:
+            self._obstacle_stop_ts  = 0.0
+            self._recovery_attempts = 0
 
         # ── State: executing a turn ───────────────────────────────────────
         if self._state == self.TURNING:
@@ -514,22 +772,59 @@ class LaneFollower:
                 self._last_turn_end = now
                 sign_det.reset()
 
-        # ── Junction latch: fire as soon as AI arms after stripe ─────────
-        # The stripe sets _junction_seen; AI response may arrive seconds later.
-        # This check fires the turn the moment both conditions are satisfied.
+        # ── State: obstacle stuck recovery ───────────────────────────────
+        if self._state == self.RECOVERING:
+            elapsed = now - self._recovery_ts
+            if self._recovery_phase == 'backup':
+                if elapsed < RECOVERY_BACK_SEC:
+                    return 0.0, -SPEED_CREEP, f'RECOVERY backup {elapsed:.1f}s', frame
+                # Backup done — pick direction from last known lane error (no AI call)
+                px.stop()
+                sleep(0.2)
+                if self._recovery_attempts == 1:
+                    # Use the same direction as the last junction turn so the car
+                    # re-enters the curve it was navigating. _turn_dir: +1=right, -1=left.
+                    rec_dir = 'right' if self._turn_dir >= 0 else 'left'
+                    print(f' [RECOVERY] attempt 1: last_turn={self._turn_dir:+d} → {rec_dir}', flush=True)
+                else:
+                    rec_dir = 'left' if self._recovery_dir > 0 else 'right'
+                    print(f' [RECOVERY] attempt {self._recovery_attempts}: flipping to {rec_dir}', flush=True)
+                self._recovery_dir   = +1 if rec_dir == 'right' else -1
+                self._recovery_phase = 'turn'
+                self._recovery_ts    = now
+            if self._recovery_phase == 'turn':
+                elapsed = now - self._recovery_ts
+                if elapsed < RECOVERY_TURN_SEC:
+                    steer = self._apply_steer(MAX_STEER * self._recovery_dir)
+                    return steer, SPEED_TURN, f'RECOVERY turn {"R" if self._recovery_dir>0 else "L"} {elapsed:.1f}s', frame
+                # Turn done — resume normal driving
+                self._state          = self.NORMAL
+                self._recovery_phase = None
+                self._i_err          = 0.0
+                self._obstacle_stop_ts = 0.0
+                print(' [RECOVERY] done — resuming', flush=True)
+
+        # ── Junction latch: active pan scan then wait for background AI ──
         if self._junction_seen and not self._in_cooldown():
+            # Background AI already armed — fire immediately
             if armed_dir != 'none':
                 self._junction_seen = False
                 return self._fire_turn(armed_dir, dist, 'LATCH+AI', frame, sign_det, now)
+            # Run pan scan exactly once per junction latch
+            if not self._scan_done:
+                self._scan_done = True
+                scanned = self._pan_scan_for_sign(sign_det)
+                if scanned != 'none':
+                    self._junction_seen = False
+                    return self._fire_turn(scanned, dist, 'SCAN', frame, sign_det, now)
+                # Scan got none — fall through, wait remaining latch window for background AI
             if (now - self._junction_ts) > JUNCTION_LATCH_SEC:
                 self._junction_seen = False
-                print(f' [JUNCTION] latch expired — no AI response, stopping.', flush=True)
-                # default fallback disabled — testing pure AI response
-                # return self._fire_turn(JUNCTION_DEFAULT_DIR, dist, 'latch-timeout', frame, sign_det, now)
-            # Still waiting — hold position, print every cycle
+                print(' [JUNCTION] latch expired — no direction found.', flush=True)
+                return 0.0, 0, 'JUNCTION expired', frame
             wait_s = now - self._junction_ts
-            print(f' [JUNCTION] waiting for AI...  {wait_s:.1f}s / {JUNCTION_LATCH_SEC:.0f}s  armed={armed_dir}', flush=True)
-            return 0.0, 0, f'JUNCTION wait AI {wait_s:.1f}s', frame
+            print(f' [JUNCTION] waiting background AI...  {wait_s:.1f}s / {JUNCTION_LATCH_SEC:.0f}s', flush=True)
+            return 0.0, 0, f'JUNCTION wait {wait_s:.1f}s', frame
 
         # ── Junction stripe detection (GS all-white) ──────────────────────
         at_junction_gs = self._junction_gs(gs)
@@ -541,6 +836,7 @@ class LaneFollower:
             if not self._junction_seen:
                 self._junction_seen = True
                 self._junction_ts   = now
+                self._scan_done     = False
                 print(f' [JUNCTION] stripe latched  gs={gs}  armed={armed_dir}', flush=True)
                 os.makedirs('/tmp/lf_debug', exist_ok=True)
                 cv2.imwrite('/tmp/lf_debug/junction_latch.jpg', frame)
@@ -593,10 +889,28 @@ class LaneFollower:
 
         if abs(error) < 0.20:
             speed = self._speed_for_dist(dist, SPEED_CRUISE)
-        elif abs(error) < 0.50:
+        elif abs(error) < 0.30:
             speed = self._speed_for_dist(dist, SPEED_CORRECT)
         else:
             speed = self._speed_for_dist(dist, SPEED_CREEP)
+
+        # Orientation check: solid line (right boundary) has larger max blob area.
+        # If left side consistently dominates, car may be in wrong lane/direction.
+        lma = dbg.get('left_max_area', 0)
+        rma = dbg.get('right_max_area', 0)
+        if lma > 0 and rma > 0:
+            if lma > rma * 1.5:  # left blob significantly larger → solid on wrong side
+                self._orientation_bad_count += 1
+                if self._orientation_bad_count >= ORIENTATION_WARN_FRAMES:
+                    print(f' [ORIENT] WARNING: solid line on LEFT '
+                          f'(L_area={lma:.0f} R_area={rma:.0f}) — possible wrong lane',
+                          flush=True)
+                    self._orientation_bad_count = 0
+                if self._orientation_bad_count > ORIENTATION_WARN_FRAMES // 2:
+                    cv2.putText(ann, 'WRONG LANE?', (ann.shape[1] // 2 - 70, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            else:
+                self._orientation_bad_count = max(0, self._orientation_bad_count - 2)
 
         lx = f'{dbg["left_cx"]:.0f}'  if dbg.get('left_cx')  is not None else '–'
         rx = f'{dbg["right_cx"]:.0f}' if dbg.get('right_cx') is not None else '–'
@@ -608,10 +922,15 @@ class LaneFollower:
                    frame, sign_det: OpenAISignDetector, now: float):
         """Commit to a turn and return the first frame's drive command."""
         if direction == 'forward':
-            # 'forward' means go straight through — no turn needed
             self._last_turn_end = now
             sign_det.reset()
             return 0.0, self._speed_for_dist(dist, SPEED_CORRECT), f'JUNCTION fwd ({trigger})', frame
+
+        if direction == 'stop':
+            sign_det.reset()
+            self.should_exit = True
+            print(f' [STOP SIGN] stripe reached — stopping and exiting. ({trigger})', flush=True)
+            return 0.0, 0, f'STOP SIGN ({trigger})', frame
 
         self._state    = self.TURNING
         self._state_ts = now
@@ -670,12 +989,17 @@ def main():
     sleep(0.3)
     print(f' Camera ready: {CAM_W}×{CAM_H} @ {CAM_FPS}fps  tilt={CAM_TILT}°')
 
+    # Web stream
+    _wt = threading.Thread(target=_start_web_stream, daemon=True)
+    _wt.start()
+    print(f' Web stream : http://0.0.0.0:8080/stream  (open in browser)')
+
     # Sign detector
     sign_det = OpenAISignDetector(enabled=not args.no_signs)
     sign_det.start()
 
     # Follower
-    follower = LaneFollower(drive_left_lane=args.left_lane)
+    follower = LaneFollower(drive_left_lane=args.left_lane, cam=cam)
     px.set_dir_servo_angle(0)
 
     print('\n Starting — Ctrl+C to stop.\n')
@@ -683,10 +1007,13 @@ def main():
     print(hdr)
     print(' ' + '─' * (len(hdr) - 1))
 
-    cycle    = 0
-    save_cyc = 0
-    stopped  = False
-    period   = 1.0 / LOOP_HZ
+    cycle         = 0
+    save_cyc      = 0
+    stopped       = False
+    period        = 1.0 / LOOP_HZ
+    last_photo_ts = 0.0
+    photo_idx     = 0
+    os.makedirs('/tmp/lf_debug', exist_ok=True)
 
     try:
         while True:
@@ -711,6 +1038,8 @@ def main():
                 cv2.putText(ann, f'AI:{ai_pending}({ai_cnt}/{AI_ARM_THRESHOLD})', (10, 20),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
 
+            push_web_frame(ann)
+
             px.set_dir_servo_angle(steer)
             if speed == 0:
                 if not stopped:
@@ -719,6 +1048,16 @@ def main():
                 px.backward(abs(speed)); stopped = False
             else:
                 px.forward(speed); stopped = False
+
+            if follower.should_exit:
+                print('\n [STOP SIGN] clean exit.', flush=True)
+                break
+
+            # Timed photo save — always on, every PHOTO_INTERVAL_SEC
+            if (monotonic() - last_photo_ts) >= PHOTO_INTERVAL_SEC:
+                cv2.imwrite(f'/tmp/lf_debug/photo_{photo_idx:04d}.jpg', ann)
+                last_photo_ts = monotonic()
+                photo_idx += 1
 
             if cycle % PRINT_EVERY == 0:
                 dist_s = f'{dist:.0f}cm' if dist > 0 else '   ---'
