@@ -71,8 +71,9 @@ SIGN_ROI_TOP = 0.00
 SIGN_ROI_BOT = 0.65
 
 # Lane blob filters
-MIN_CONTOUR_AREA = 200
-MIN_ASPECT_RATIO = 0.8
+MIN_CONTOUR_AREA       = 500    # raised from 200 — filters noise blobs on wide curves
+MIN_CONTOUR_AREA_SOLO  = 1200   # minimum area when only ONE line is visible (stricter)
+MIN_ASPECT_RATIO       = 0.8
 
 # Grayscale — raw ADC values (dark mat ≈ 200–400, white tape ≈ 800–2000)
 GS_WHITE_THRESHOLD = 600
@@ -103,11 +104,15 @@ GAP_HOLD_DECAY  =  0.97  # per-frame decay of last error during gap
 GAP_JUNCTION_MIN =  5    # camera-gap frames needed before sonar gate is checked
 
 # Turn execution
-TURN_HOLD_SEC         = 2.6    # seconds to hold full steer during a turn
+TURN_HOLD_SEC         = 2.4    # seconds to hold full steer during a turn
 JUNCTION_LATCH_SEC    = 12.0   # seconds to remember a junction stripe before giving up
 JUNCTION_DEFAULT_DIR  = 'right'  # fallback if AI never arms before latch expires
 TURN_COOLDOWN   = 5.0    # seconds after turn before new sign arming is allowed
 STOP_HOLD_SEC   = 3.0    # seconds to pause at a stop sign
+
+# Post-turn settle — gentle re-acquisition of lane after a turn completes
+POST_TURN_SETTLE_SEC  = 1.0   # seconds of soft authority after turn ends
+POST_TURN_MAX_STEER   = 18.0  # steer cap during settle (vs MAX_STEER=28 normally)
 
 # Stuck recovery
 RECOVERY_SONAR_CM    = 14    # cm — only recover when this close (tighter than STOP_DIST)
@@ -268,18 +273,24 @@ class LaneDetector:
         n_left  = len(left_blobs)
         n_right = len(right_blobs)
 
+        solo_mode = False  # True when estimating from a single line
         if left_cx is not None and right_cx is not None:
             lane_cx = (left_cx + right_cx) / 2.0
         elif right_cx is not None:
-            # ≥2 blobs on right = dashed centre line drifted to right side (car went left)
-            # 1 blob on right = solid outer boundary (normal position)
+            # Solo line — reject if the largest blob is too small (likely noise)
+            if max(b['area'] for b in right_blobs) < MIN_CONTOUR_AREA_SOLO:
+                self.last_error_valid = False
+                return None, 0, {'v_thr': v_thr, 'blobs': 0}, ann
+            solo_mode = True
             if n_right >= 2:
                 lane_cx = right_cx - (0.5 - LANE_LEFT_LINE_TARGET) * w
             else:
                 lane_cx = right_cx - (LANE_RIGHT_LINE_TARGET - 0.5) * w
         elif left_cx is not None:
-            # ≥2 blobs on left = dashed centre line in normal position (correct side)
-            # 1 blob on left = solid boundary appeared on left (car far right)
+            if max(b['area'] for b in left_blobs) < MIN_CONTOUR_AREA_SOLO:
+                self.last_error_valid = False
+                return None, 0, {'v_thr': v_thr, 'blobs': 0}, ann
+            solo_mode = True
             if n_left >= 2:
                 lane_cx = left_cx + (0.5 - LANE_LEFT_LINE_TARGET) * w
             else:
@@ -292,6 +303,12 @@ class LaneDetector:
             lane_cx = w - lane_cx
 
         error = (lane_cx - w / 2.0) / (w / 2.0)
+
+        # In solo-line mode, blend with previous error to suppress noise jumps on curves.
+        # Two-line mode is unaffected — full raw error used.
+        if solo_mode and self.last_error_valid and hasattr(self, '_smoothed_error'):
+            error = 0.6 * error + 0.4 * self._smoothed_error
+        self._smoothed_error = error
 
         # Annotate
         for b in blobs:
@@ -713,6 +730,39 @@ class LaneFollower:
         print(f' [SCAN] result={centre} (centre fallback)  all={results}', flush=True)
         return centre
 
+    # ── Recovery scan ────────────────────────────────────────────────────────
+    def _recovery_scan(self, sign_det: 'OpenAISignDetector') -> str:
+        """
+        Pan camera left/centre/right at ROAD tilt and ask AI which way to
+        turn to get back onto the lane (uses RECOVERY_PROMPT, not sign prompt).
+        Returns 'left' or 'right'.
+        """
+        px.set_dir_servo_angle(0)
+        px.set_cam_tilt_angle(CAM_TILT)   # road-facing, NOT raised like sign scan
+        sleep(0.4)
+
+        results = []
+        for pan in SCAN_PAN_POSITIONS:
+            px.set_cam_pan_angle(pan)
+            sleep(0.45)
+            if self._cam is not None:
+                frame = self._cam.capture_array()
+                result = sign_det.call_recovery(frame)
+            else:
+                result = 'right'
+            results.append(result)
+            print(f' [RECOVERY-SCAN] pan={pan:+d}° → {result}', flush=True)
+
+        px.set_cam_pan_angle(CAM_PAN)
+        sleep(0.3)
+
+        counts: dict[str, int] = {}
+        for r in results:
+            counts[r] = counts.get(r, 0) + 1
+        best = max(counts, key=counts.get)
+        print(f' [RECOVERY-SCAN] result={best}  all={results}', flush=True)
+        return best
+
     # ── Main decision ─────────────────────────────────────────────────────────
 
     def decide(self, frame, gs, dist, armed_dir: str, sign_det: OpenAISignDetector):
@@ -758,6 +808,8 @@ class LaneFollower:
             else:
                 self._state         = self.NORMAL
                 self._i_err         = 0.0
+                self._steer         = 0.0   # snap wheels to straight — don't carry +28° into PID
+                self._last_err      = 0.0   # clear pre-turn error so gap-hold doesn't steer wrong way
                 self._last_turn_end = now
                 self._junction_seen = False
                 sign_det.reset()
@@ -778,11 +830,11 @@ class LaneFollower:
             if self._recovery_phase == 'backup':
                 if elapsed < RECOVERY_BACK_SEC:
                     return 0.0, -SPEED_CREEP, f'RECOVERY backup {elapsed:.1f}s', frame
-                # Backup done — pan scan to decide which way to go
+                # Backup done — scan with RECOVERY prompt (which way to get back on lane)
                 px.stop()
                 sleep(0.2)
-                print(f' [RECOVERY] backup done — pan scanning for direction...', flush=True)
-                scanned = self._pan_scan_for_sign(sign_det)
+                print(f' [RECOVERY] backup done — scanning for lane direction...', flush=True)
+                scanned = self._recovery_scan(sign_det)
                 if scanned in ('left', 'right'):
                     rec_dir = scanned
                     print(f' [RECOVERY] scan → {rec_dir}', flush=True)
@@ -890,10 +942,17 @@ class LaneFollower:
         raw   = self._pid(error)
         steer = self._apply_steer(raw)
 
+        # Post-turn settle: cap steer and speed for POST_TURN_SETTLE_SEC after
+        # any turn completes so the car re-acquires the lane gently.
+        in_settle = (now - self._last_turn_end) < POST_TURN_SETTLE_SEC
+        if in_settle:
+            steer = max(-POST_TURN_MAX_STEER, min(POST_TURN_MAX_STEER, steer))
+            self._steer = steer  # keep internal state consistent
+
         if abs(error) < 0.20:
-            speed = self._speed_for_dist(dist, SPEED_CRUISE)
+            speed = self._speed_for_dist(dist, SPEED_CREEP if in_settle else SPEED_CRUISE)
         elif abs(error) < 0.30:
-            speed = self._speed_for_dist(dist, SPEED_CORRECT)
+            speed = self._speed_for_dist(dist, SPEED_CREEP if in_settle else SPEED_CORRECT)
         else:
             speed = self._speed_for_dist(dist, SPEED_CREEP)
 
